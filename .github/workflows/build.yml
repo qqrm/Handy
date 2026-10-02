@@ -520,11 +520,7 @@ jobs:
         shell: bash
         run: |
           bun run tauri signer generate -w "$RUNNER_TEMP/updater.key" -p ""
-          {
-            echo "TAURI_SIGNING_PRIVATE_KEY<<EOF"
-            cat "$RUNNER_TEMP/updater.key"
-            echo "EOF"
-          } >> "$GITHUB_ENV"
+          echo "TAURI_SIGNING_PRIVATE_KEY_PATH=$RUNNER_TEMP/updater.key" >> "$GITHUB_ENV"
 
       - name: Build with Tauri
         uses: tauri-apps/tauri-action@v0
