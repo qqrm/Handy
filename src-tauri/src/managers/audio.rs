@@ -279,10 +279,7 @@ fn pause_playing_media_sessions() -> Vec<String> {
             if !playing {
                 continue;
             }
-            let accepted = session
-                .TryPauseAsync()
-                .and_then(|op| op.get())
-                .unwrap_or(false);
+            let accepted = session.TryPauseAsync().and_then(|op| op.get()).unwrap_or(false);
             if !accepted {
                 continue;
             }
@@ -770,10 +767,7 @@ impl AudioRecordingManager {
         if *is_open {
             pause_guard.paused_sources = pause_playing_media_sessions();
             pause_guard.did_pause = true;
-            debug!(
-                "Media pause applied ({} sessions)",
-                pause_guard.paused_sources.len()
-            );
+            debug!("Media pause applied ({} sessions)", pause_guard.paused_sources.len());
         }
     }
 

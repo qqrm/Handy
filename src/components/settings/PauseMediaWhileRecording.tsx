@@ -8,25 +8,24 @@ interface PauseMediaWhileRecordingToggleProps {
   grouped?: boolean;
 }
 
-export const PauseMediaWhileRecording: React.FC<
-  PauseMediaWhileRecordingToggleProps
-> = React.memo(({ descriptionMode = "tooltip", grouped = false }) => {
-  const { t } = useTranslation();
-  const { getSetting, updateSetting, isUpdating } = useSettings();
+export const PauseMediaWhileRecording: React.FC<PauseMediaWhileRecordingToggleProps> =
+  React.memo(({ descriptionMode = "tooltip", grouped = false }) => {
+    const { t } = useTranslation();
+    const { getSetting, updateSetting, isUpdating } = useSettings();
 
-  const pauseEnabled = getSetting("pause_media_while_recording") ?? false;
+    const pauseEnabled = getSetting("pause_media_while_recording") ?? false;
 
-  return (
-    <ToggleSwitch
-      checked={pauseEnabled}
-      onChange={(enabled) =>
-        updateSetting("pause_media_while_recording", enabled)
-      }
-      isUpdating={isUpdating("pause_media_while_recording")}
-      label={t("settings.debug.pauseMediaWhileRecording.label")}
-      description={t("settings.debug.pauseMediaWhileRecording.description")}
-      descriptionMode={descriptionMode}
-      grouped={grouped}
-    />
-  );
-});
+    return (
+      <ToggleSwitch
+        checked={pauseEnabled}
+        onChange={(enabled) =>
+          updateSetting("pause_media_while_recording", enabled)
+        }
+        isUpdating={isUpdating("pause_media_while_recording")}
+        label={t("settings.debug.pauseMediaWhileRecording.label")}
+        description={t("settings.debug.pauseMediaWhileRecording.description")}
+        descriptionMode={descriptionMode}
+        grouped={grouped}
+      />
+    );
+  });
