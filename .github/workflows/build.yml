@@ -512,16 +512,6 @@ jobs:
           chmod +x "$tools_dir/linuxdeploy-${arch}.AppImage"
           "$tools_dir/linuxdeploy-${arch}.AppImage" --appimage-extract-and-run --version
 
-      - name: Generate throwaway updater signing key (fork builds)
-        # Forks have no TAURI_SIGNING_PRIVATE_KEY secret, and tauri refuses to
-        # bundle with createUpdaterArtifacts enabled and the key unset. A key
-        # generated here signs artifacts that nothing will ever verify, which
-        # is fine for test/installer artifacts.
-        shell: bash
-        run: |
-          bun run tauri signer generate -w "$RUNNER_TEMP/updater.key" -p ""
-          echo "TAURI_SIGNING_PRIVATE_KEY_PATH=$RUNNER_TEMP/updater.key" >> "$GITHUB_ENV"
-
       - name: Build with Tauri
         uses: tauri-apps/tauri-action@v0
         env:
