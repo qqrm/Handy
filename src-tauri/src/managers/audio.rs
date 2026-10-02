@@ -279,7 +279,10 @@ fn pause_playing_media_sessions() -> Vec<String> {
             if !playing {
                 continue;
             }
-            let accepted = session.TryPauseAsync().and_then(|op| op.get()).unwrap_or(false);
+            let accepted = session
+                .TryPauseAsync()
+                .and_then(|op| op.get())
+                .unwrap_or(false);
             if !accepted {
                 continue;
             }
@@ -298,9 +301,7 @@ fn pause_playing_media_sessions() -> Vec<String> {
 /// are unaffected (play on an already-playing session is a no-op).
 #[cfg(target_os = "windows")]
 fn resume_media_sessions(paused: &[String]) {
-    use windows::Media::Control::{
-        GlobalSystemMediaTransportControlsSessionManager as SessionManager,
-    };
+    use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager as SessionManager;
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
     unsafe {
@@ -767,7 +768,10 @@ impl AudioRecordingManager {
         if *is_open {
             pause_guard.paused_sources = pause_playing_media_sessions();
             pause_guard.did_pause = true;
-            debug!("Media pause applied ({} sessions)", pause_guard.paused_sources.len());
+            debug!(
+                "Media pause applied ({} sessions)",
+                pause_guard.paused_sources.len()
+            );
         }
     }
 
