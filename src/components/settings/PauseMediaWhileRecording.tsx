@@ -28,5 +28,5 @@ export const PauseMediaWhileRecording: React.FC<
       descriptionMode={descriptionMode}
       grouped={grouped}
     />
-  });
+  );
 });
