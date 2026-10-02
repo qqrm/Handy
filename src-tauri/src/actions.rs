@@ -601,6 +601,7 @@ impl ShortcutAction for TranscribeAction {
                     }
                     if rm_clone.is_recording_readiness_current(generation) {
                         rm_clone.apply_mute();
+                        rm_clone.apply_media_pause();
                     }
                 });
             }
@@ -677,6 +678,8 @@ impl ShortcutAction for TranscribeAction {
 
         // Unmute before playing audio feedback so the stop sound is audible
         rm.remove_mute();
+        // Resume media we paused for the recording, mirroring the unmute above.
+        rm.remove_media_pause();
 
         // Play audio feedback for recording stop
         play_feedback_sound(app, SoundType::Stop);

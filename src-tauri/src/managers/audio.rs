@@ -230,6 +230,124 @@ fn restore_mute(prev_muted: Option<bool>) {
     }
 }
 
+/* ──────────────────────────────────────────────────────────────── */
+
+/// Pauses every SMTC (System Media Transport Controls) session that is
+/// currently playing and returns the source IDs of the sessions *we* paused,
+/// so `resume_media_sessions` can resume exactly those. Sessions the user
+/// paused on their own, or that were already stopped, are never touched.
+///
+/// Expected behavior:
+/// - Windows: works with any SMTC-integrated app (browsers, Spotify, VLC,
+///   most media players). Apps that don't register SMTC sessions are ignored.
+/// - Other platforms: no-op (no sessions paused).
+#[cfg(target_os = "windows")]
+fn pause_playing_media_sessions() -> Vec<String> {
+    use windows::Media::Control::{
+        GlobalSystemMediaTransportControlsSessionManager as SessionManager,
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
+    };
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+
+    let mut paused = Vec::new();
+    unsafe {
+        // Same apartment setup as the WASAPI mute path above: MTA is fine on a
+        // background worker, and re-initialization is a no-op.
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+
+        let manager = match SessionManager::RequestAsync().and_then(|op| op.get()) {
+            Ok(manager) => manager,
+            Err(e) => {
+                debug!("SMTC session manager unavailable: {e}");
+                return paused;
+            }
+        };
+        let sessions = match manager.GetSessions() {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                debug!("Failed to enumerate SMTC sessions: {e}");
+                return paused;
+            }
+        };
+
+        for session in sessions {
+            let playing = session
+                .GetPlaybackInfo()
+                .ok()
+                .and_then(|info| info.PlaybackStatus().ok())
+                .is_some_and(|status| status == PlaybackStatus::Playing);
+            if !playing {
+                continue;
+            }
+            let accepted = session
+                .TryPauseAsync()
+                .and_then(|op| op.get())
+                .unwrap_or(false);
+            if !accepted {
+                continue;
+            }
+            if let Ok(source_id) = session.SourceAppUserModelId() {
+                debug!("Paused media session: {source_id}");
+                paused.push(source_id.to_string());
+            }
+        }
+    }
+    paused
+}
+
+/// Resumes the SMTC sessions identified by `paused` (the source IDs returned
+/// by `pause_playing_media_sessions`). Sessions that have since exited are
+/// silently skipped; sessions still running but manually resumed by the user
+/// are unaffected (play on an already-playing session is a no-op).
+#[cfg(target_os = "windows")]
+fn resume_media_sessions(paused: &[String]) {
+    use windows::Media::Control::{
+        GlobalSystemMediaTransportControlsSessionManager as SessionManager,
+    };
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+
+        let manager = match SessionManager::RequestAsync().and_then(|op| op.get()) {
+            Ok(manager) => manager,
+            Err(e) => {
+                debug!("SMTC session manager unavailable: {e}");
+                return;
+            }
+        };
+        let sessions = match manager.GetSessions() {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                debug!("Failed to enumerate SMTC sessions: {e}");
+                return;
+            }
+        };
+
+        for session in sessions {
+            let Ok(source_id) = session.SourceAppUserModelId() else {
+                continue;
+            };
+            let source_id = source_id.to_string();
+            if !paused.contains(&source_id) {
+                continue;
+            }
+            match session.TryPlayAsync().and_then(|op| op.get()) {
+                Ok(true) => debug!("Resumed media session: {source_id}"),
+                _ => debug!("Failed to resume media session: {source_id}"),
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn pause_playing_media_sessions() -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resume_media_sessions(_paused: &[String]) {}
+
 const WHISPER_SAMPLE_RATE: usize = 16000;
 
 /* ──────────────────────────────────────────────────────────────── */
@@ -255,6 +373,16 @@ pub enum MicrophoneMode {
 struct MuteState {
     did_mute: bool,
     prev_muted: Option<bool>,
+}
+
+/// Tracks our "pause media while recording" so stop can resume exactly the
+/// sessions we paused. `did_pause` is true while our pause is active;
+/// `paused_sources` holds the SMTC source IDs of the sessions we paused, so a
+/// session the user paused on their own is never resumed behind their back.
+#[derive(Debug, Default, Clone)]
+struct MediaPauseState {
+    did_pause: bool,
+    paused_sources: Vec<String>,
 }
 
 /// The persisted microphone preference currently in effect. Clamshell and
@@ -382,6 +510,7 @@ pub struct AudioRecordingManager {
     is_open: Arc<Mutex<bool>>,
     is_recording: Arc<Mutex<bool>>,
     mute_state: Arc<Mutex<MuteState>>,
+    media_pause_state: Arc<Mutex<MediaPauseState>>,
     close_generation: Arc<AtomicU64>,
     cancel_generation: Arc<AtomicU64>,
     stream_router: Arc<StreamRouter>,
@@ -427,6 +556,7 @@ impl AudioRecordingManager {
             is_open: Arc::new(Mutex::new(false)),
             is_recording: Arc::new(Mutex::new(false)),
             mute_state: Arc::new(Mutex::new(MuteState::default())),
+            media_pause_state: Arc::new(Mutex::new(MediaPauseState::default())),
             close_generation: Arc::new(AtomicU64::new(0)),
             cancel_generation: Arc::new(AtomicU64::new(0)),
             stream_router,
@@ -620,6 +750,44 @@ impl AudioRecordingManager {
         }
     }
 
+    /// Pauses currently-playing media sessions if pause_media_while_recording
+    /// is enabled and the stream is open. Records which sessions were paused
+    /// so `remove_media_pause` resumes only those.
+    pub fn apply_media_pause(&self) {
+        let settings = get_settings(&self.app_handle);
+        if !settings.pause_media_while_recording {
+            return;
+        }
+
+        // Lock order: is_open before media_pause_state (matches mute handling).
+        let is_open = self.is_open.lock().unwrap();
+        let mut pause_guard = self.media_pause_state.lock().unwrap();
+        // Already paused this session — don't re-pause, or a duplicate/late
+        // apply would snapshot sessions the user resumed mid-recording.
+        if pause_guard.did_pause {
+            return;
+        }
+        if *is_open {
+            pause_guard.paused_sources = pause_playing_media_sessions();
+            pause_guard.did_pause = true;
+            debug!(
+                "Media pause applied ({} sessions)",
+                pause_guard.paused_sources.len()
+            );
+        }
+    }
+
+    /// Resumes the media sessions paused by `apply_media_pause`, if any.
+    pub fn remove_media_pause(&self) {
+        let mut pause_guard = self.media_pause_state.lock().unwrap();
+        if pause_guard.did_pause {
+            resume_media_sessions(&pause_guard.paused_sources);
+            pause_guard.did_pause = false;
+            pause_guard.paused_sources.clear();
+            debug!("Media pause removed");
+        }
+    }
+
     pub fn preload_vad(&self) -> Result<(), anyhow::Error> {
         let mut recorder_opt = self.recorder.lock().unwrap();
         if recorder_opt.is_none() {
@@ -667,6 +835,10 @@ impl AudioRecordingManager {
                     mute_guard.did_mute = false;
                 }
             }
+            // Media pause doesn't need an inline variant: this holds only
+            // `is_open`, and remove_media_pause locks media_pause_state after
+            // it — the same order apply_media_pause uses.
+            self.remove_media_pause();
             if let Some(rec) = self.recorder.lock().unwrap().as_mut() {
                 let _ = rec.close();
             }
@@ -690,6 +862,8 @@ impl AudioRecordingManager {
                 mute_guard.did_mute = false;
             }
         }
+        // Same belt-and-suspenders for paused media: never strand it paused.
+        self.remove_media_pause();
 
         // Get the selected device from settings, considering clamshell mode.
         // No pre-flight enumeration here: when nothing is configured the
@@ -759,6 +933,9 @@ impl AudioRecordingManager {
             }
             mute_guard.did_mute = false;
         }
+        // Mirror the mute restore so paused media is never left stranded when
+        // the stream closes (lazy close, mode switch, device change).
+        self.remove_media_pause();
 
         if let Some(rec) = self.recorder.lock().unwrap().as_mut() {
             // If still recording, stop first.
