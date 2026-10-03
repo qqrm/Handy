@@ -535,6 +535,10 @@
         "label": "録音中にミュート",
         "description": "録音中にシステムオーディオをミュート"
       },
+      "pauseMediaWhileRecording": {
+        "label": "Pause Media While Recording",
+        "description": "Pause currently playing media during recording and resume it afterwards"
+      },
       "appendTrailingSpace": {
         "label": "末尾にスペースを追加",
         "description": "貼り付けた文字起こしの後にスペースを追加"
