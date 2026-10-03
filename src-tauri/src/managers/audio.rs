@@ -1475,11 +1475,16 @@ mod media_pause_tests {
 
     #[test]
     fn resumable_sessions_keeps_only_live_sessions_we_paused() {
-        // "b" exited while paused and "dead" is stale — neither is live;
-        // "x" is live but the user paused it on their own. Only "a" and "c"
-        // are both live and ours, so only they may resume.
+        // Live now: "a", "c", "x". We paused "a", "b", "c", "dead" — "b" and
+        // "dead" have since exited; "x" the user paused on their own. Only
+        // "a" and "c" are both live and ours, so only they may resume.
         let current = vec!["a".to_string(), "c".to_string(), "x".to_string()];
-        let paused = vec!["a".to_string(), "b".to_string(), "dead".to_string()];
+        let paused = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "dead".to_string(),
+        ];
         assert_eq!(
             resumable_sessions(&current, &paused),
             vec!["a".to_string(), "c".to_string()]
