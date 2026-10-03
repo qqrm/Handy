@@ -32,8 +32,10 @@ struct SessionState {
 enum PausedPlaybackState {
     #[cfg(target_os = "macos")]
     Global,
-    #[cfg(any(target_os = "windows", target_os = "linux", test))]
+    #[cfg(any(target_os = "linux", test))]
     Session(String),
+    #[cfg(target_os = "windows")]
+    Sessions(Vec<String>),
 }
 
 trait MediaControlBackend: Send + Sync {
@@ -206,14 +208,20 @@ fn platform_resume_playback(paused_playback: PausedPlaybackState) -> Result<(), 
 
 #[cfg(target_os = "windows")]
 fn platform_pause_playback() -> Result<Option<PausedPlaybackState>, String> {
-    platform_windows::pause_active_session()
-        .map(|session| session.map(PausedPlaybackState::Session))
+    platform_windows::pause_active_sessions().map(|sessions| {
+        (!sessions.is_empty()).then(|| PausedPlaybackState::Sessions(sessions))
+    })
 }
 
 #[cfg(target_os = "windows")]
 fn platform_resume_playback(paused_playback: PausedPlaybackState) -> Result<(), String> {
-    let PausedPlaybackState::Session(source_app_user_model_id) = paused_playback;
-    platform_windows::resume_session(&source_app_user_model_id)
+    match paused_playback {
+        PausedPlaybackState::Sessions(source_app_user_model_ids) => {
+            platform_windows::resume_sessions(&source_app_user_model_ids)
+        }
+        #[cfg(test)]
+        _ => Ok(()),
+    }
 }
 
 #[cfg(target_os = "linux")]
