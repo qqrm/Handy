@@ -301,7 +301,10 @@ fn pause_playing_media_sessions() -> Vec<String> {
 /// are unaffected (play on an already-playing session is a no-op).
 #[cfg(target_os = "windows")]
 fn resume_media_sessions(paused: &[String]) {
-    use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager as SessionManager;
+    use windows::Media::Control::{
+        GlobalSystemMediaTransportControlsSession as Session,
+        GlobalSystemMediaTransportControlsSessionManager as SessionManager,
+    };
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
     unsafe {
@@ -322,12 +325,21 @@ fn resume_media_sessions(paused: &[String]) {
             }
         };
 
-        for session in sessions {
-            let Ok(source_id) = session.SourceAppUserModelId() else {
-                continue;
-            };
-            let source_id = source_id.to_string();
-            if !paused.contains(&source_id) {
+        let live: Vec<(String, Session)> = sessions
+            .into_iter()
+            .filter_map(|session| {
+                session
+                    .SourceAppUserModelId()
+                    .ok()
+                    .map(|id| (id.to_string(), session))
+            })
+            .collect();
+        // Filter through `resumable_sessions` — the same pure predicate the
+        // unit tests cover — so only sessions *we* paused are ever resumed.
+        let live_ids: Vec<String> = live.iter().map(|(id, _)| id.clone()).collect();
+        let resume_ids = resumable_sessions(&live_ids, paused);
+        for (source_id, session) in live {
+            if !resume_ids.contains(&source_id) {
                 continue;
             }
             match session.TryPlayAsync().and_then(|op| op.get()) {
@@ -381,6 +393,100 @@ struct MuteState {
 struct MediaPauseState {
     did_pause: bool,
     paused_sources: Vec<String>,
+}
+
+/// Platform operations backing "pause media while recording". Split behind a
+/// trait so the decision logic in `MediaPauseController` is unit-testable
+/// without a real SMTC session (which only exists on an interactive Windows
+/// desktop, i.e. never in CI).
+trait MediaControlBackend: Send + Sync {
+    /// Pauses every currently-playing media session, returning the source IDs
+    /// of the sessions *we* paused.
+    fn pause_playing_sessions(&self) -> Vec<String>;
+    /// Resumes exactly the sessions identified by `paused`.
+    fn resume_sessions(&self, paused: &[String]);
+}
+
+struct PlatformMediaControlBackend;
+
+impl MediaControlBackend for PlatformMediaControlBackend {
+    fn pause_playing_sessions(&self) -> Vec<String> {
+        pause_playing_media_sessions()
+    }
+
+    fn resume_sessions(&self, paused: &[String]) {
+        resume_media_sessions(paused)
+    }
+}
+
+/// The sessions from `current` that appear in `paused`: what a resume pass is
+/// allowed to touch. A session that exited while paused, or one the user
+/// paused on their own, is skipped — only what *we* paused comes back.
+fn resumable_sessions(current: &[String], paused: &[String]) -> Vec<String> {
+    current
+        .iter()
+        .filter(|id| paused.contains(id))
+        .cloned()
+        .collect()
+}
+
+/// Decision core for "pause media while recording": owns what was paused by
+/// us and drives a `MediaControlBackend`. Holds no Tauri handles, so the
+/// whole lifecycle is unit-testable against a mock backend.
+#[derive(Clone)]
+struct MediaPauseController {
+    state: Arc<Mutex<MediaPauseState>>,
+    backend: Arc<dyn MediaControlBackend>,
+}
+
+impl MediaPauseController {
+    fn new(backend: Arc<dyn MediaControlBackend>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MediaPauseState::default())),
+            backend,
+        }
+    }
+
+    /// `setting_enabled` mirrors `pause_media_while_recording`; `stream_open`
+    /// mirrors the microphone stream being open (the same gating the mute
+    /// path applies).
+    fn apply(&self, setting_enabled: bool, stream_open: bool) {
+        if !setting_enabled {
+            return;
+        }
+
+        let mut guard = self.state.lock().unwrap();
+        // Already paused this recording — don't re-pause, or a duplicate/late
+        // apply would snapshot sessions the user resumed mid-recording.
+        if guard.did_pause {
+            return;
+        }
+        if !stream_open {
+            return;
+        }
+        guard.paused_sources = self.backend.pause_playing_sessions();
+        guard.did_pause = true;
+        debug!(
+            "Media pause applied ({} sessions)",
+            guard.paused_sources.len()
+        );
+    }
+
+    /// Resumes the media sessions paused by `apply`, if any, and forgets
+    /// them so a second `remove` is a no-op.
+    fn remove(&self) {
+        let paused = {
+            let mut guard = self.state.lock().unwrap();
+            if !guard.did_pause {
+                return;
+            }
+            guard.did_pause = false;
+            std::mem::take(&mut guard.paused_sources)
+        };
+        // The backend does WinRT IO; don't hold the state lock across it.
+        self.backend.resume_sessions(&paused);
+        debug!("Media pause removed");
+    }
 }
 
 /// The persisted microphone preference currently in effect. Clamshell and
@@ -508,7 +614,7 @@ pub struct AudioRecordingManager {
     is_open: Arc<Mutex<bool>>,
     is_recording: Arc<Mutex<bool>>,
     mute_state: Arc<Mutex<MuteState>>,
-    media_pause_state: Arc<Mutex<MediaPauseState>>,
+    media_pause: MediaPauseController,
     close_generation: Arc<AtomicU64>,
     cancel_generation: Arc<AtomicU64>,
     stream_router: Arc<StreamRouter>,
@@ -554,7 +660,7 @@ impl AudioRecordingManager {
             is_open: Arc::new(Mutex::new(false)),
             is_recording: Arc::new(Mutex::new(false)),
             mute_state: Arc::new(Mutex::new(MuteState::default())),
-            media_pause_state: Arc::new(Mutex::new(MediaPauseState::default())),
+            media_pause: MediaPauseController::new(Arc::new(PlatformMediaControlBackend)),
             close_generation: Arc::new(AtomicU64::new(0)),
             cancel_generation: Arc::new(AtomicU64::new(0)),
             stream_router,
@@ -753,37 +859,16 @@ impl AudioRecordingManager {
     /// so `remove_media_pause` resumes only those.
     pub fn apply_media_pause(&self) {
         let settings = get_settings(&self.app_handle);
-        if !settings.pause_media_while_recording {
-            return;
-        }
-
-        // Lock order: is_open before media_pause_state (matches mute handling).
-        let is_open = self.is_open.lock().unwrap();
-        let mut pause_guard = self.media_pause_state.lock().unwrap();
-        // Already paused this session — don't re-pause, or a duplicate/late
-        // apply would snapshot sessions the user resumed mid-recording.
-        if pause_guard.did_pause {
-            return;
-        }
-        if *is_open {
-            pause_guard.paused_sources = pause_playing_media_sessions();
-            pause_guard.did_pause = true;
-            debug!(
-                "Media pause applied ({} sessions)",
-                pause_guard.paused_sources.len()
-            );
-        }
+        // The is_open guard is dropped before the controller takes its own
+        // lock, so no lock ordering is shared with the mute path.
+        let stream_open = *self.is_open.lock().unwrap();
+        self.media_pause
+            .apply(settings.pause_media_while_recording, stream_open);
     }
 
     /// Resumes the media sessions paused by `apply_media_pause`, if any.
     pub fn remove_media_pause(&self) {
-        let mut pause_guard = self.media_pause_state.lock().unwrap();
-        if pause_guard.did_pause {
-            resume_media_sessions(&pause_guard.paused_sources);
-            pause_guard.did_pause = false;
-            pause_guard.paused_sources.clear();
-            debug!("Media pause removed");
-        }
+        self.media_pause.remove();
     }
 
     pub fn preload_vad(&self) -> Result<(), anyhow::Error> {
@@ -833,9 +918,8 @@ impl AudioRecordingManager {
                     mute_guard.did_mute = false;
                 }
             }
-            // Media pause doesn't need an inline variant: this holds only
-            // `is_open`, and remove_media_pause locks media_pause_state after
-            // it — the same order apply_media_pause uses.
+            // Media pause doesn't need an inline variant: remove_media_pause
+            // takes only the controller's own lock, never `is_open`.
             self.remove_media_pause();
             if let Some(rec) = self.recorder.lock().unwrap().as_mut() {
                 let _ = rec.close();
@@ -1272,5 +1356,130 @@ impl AudioRecordingManager {
             }
             RecordingState::Idle => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod media_pause_tests {
+    use super::*;
+
+    /// Records backend calls; whatever is in `playing` is what a pause pass
+    /// would target and report back as paused by us.
+    struct MockBackend {
+        playing: Mutex<Vec<String>>,
+        pause_calls: Mutex<usize>,
+        resumed: Mutex<Vec<String>>,
+    }
+
+    impl MockBackend {
+        fn new(playing: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                playing: Mutex::new(playing.iter().map(|s| s.to_string()).collect()),
+                pause_calls: Mutex::new(0),
+                resumed: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn pause_calls(&self) -> usize {
+            *self.pause_calls.lock().unwrap()
+        }
+
+        fn resumed(&self) -> Vec<String> {
+            self.resumed.lock().unwrap().clone()
+        }
+    }
+
+    impl MediaControlBackend for MockBackend {
+        fn pause_playing_sessions(&self) -> Vec<String> {
+            *self.pause_calls.lock().unwrap() += 1;
+            self.playing.lock().unwrap().clone()
+        }
+
+        fn resume_sessions(&self, paused: &[String]) {
+            self.resumed.lock().unwrap().extend_from_slice(paused);
+        }
+    }
+
+    fn controller(playing: &[&str]) -> (MediaPauseController, Arc<MockBackend>) {
+        let backend = MockBackend::new(playing);
+        (MediaPauseController::new(Arc::clone(&backend)), backend)
+    }
+
+    #[test]
+    fn apply_is_noop_when_setting_disabled() {
+        let (c, b) = controller(&["chrome", "spotify"]);
+        c.apply(false, true);
+        assert_eq!(b.pause_calls(), 0);
+    }
+
+    #[test]
+    fn apply_is_noop_when_stream_closed() {
+        let (c, b) = controller(&["chrome"]);
+        c.apply(true, false);
+        assert_eq!(b.pause_calls(), 0);
+    }
+
+    #[test]
+    fn apply_pauses_every_playing_session() {
+        let (c, b) = controller(&["chrome", "spotify"]);
+        c.apply(true, true);
+        assert_eq!(b.pause_calls(), 1);
+        let state = c.state.lock().unwrap();
+        assert!(state.did_pause);
+        assert_eq!(state.paused_sources, vec!["chrome", "spotify"]);
+    }
+
+    #[test]
+    fn duplicate_apply_pauses_only_once() {
+        let (c, b) = controller(&["chrome"]);
+        c.apply(true, true);
+        c.apply(true, true);
+        assert_eq!(b.pause_calls(), 1);
+    }
+
+    #[test]
+    fn remove_resumes_exactly_what_we_paused() {
+        let (c, b) = controller(&["chrome", "spotify"]);
+        c.apply(true, true);
+        c.remove();
+        assert_eq!(b.resumed(), vec!["chrome", "spotify"]);
+    }
+
+    #[test]
+    fn remove_without_apply_is_noop() {
+        let (c, b) = controller(&["chrome"]);
+        c.remove();
+        assert!(b.resumed().is_empty());
+    }
+
+    #[test]
+    fn second_remove_resumes_nothing() {
+        let (c, b) = controller(&["chrome"]);
+        c.apply(true, true);
+        c.remove();
+        c.remove();
+        assert_eq!(b.resumed(), vec!["chrome"]);
+    }
+
+    #[test]
+    fn reapply_after_remove_pauses_fresh_sessions() {
+        let (c, b) = controller(&["chrome"]);
+        c.apply(true, true);
+        c.remove();
+        c.apply(true, true);
+        assert_eq!(b.pause_calls(), 2);
+    }
+
+    #[test]
+    fn resumable_sessions_keeps_only_live_sessions_we_paused() {
+        // "b" exited while paused and "dead" is stale — neither is live;
+        // "x" is live but the user paused it on their own. Only "a" and "c"
+        // are both live and ours, so only they may resume.
+        let current = vec!["a".to_string(), "c".to_string(), "x".to_string()];
+        let paused = vec!["a".to_string(), "b".to_string(), "dead".to_string()];
+        assert_eq!(
+            resumable_sessions(&current, &paused),
+            vec!["a".to_string(), "c".to_string()]
+        );
     }
 }
