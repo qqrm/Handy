@@ -422,6 +422,9 @@ impl MediaControlBackend for PlatformMediaControlBackend {
 /// The sessions from `current` that appear in `paused`: what a resume pass is
 /// allowed to touch. A session that exited while paused, or one the user
 /// paused on their own, is skipped — only what *we* paused comes back.
+// Compiled on Windows (the only live resume path) and under `cargo test`,
+// where the unit tests exercise it directly.
+#[cfg(any(target_os = "windows", test))]
 fn resumable_sessions(current: &[String], paused: &[String]) -> Vec<String> {
     current
         .iter()
@@ -1402,7 +1405,7 @@ mod media_pause_tests {
 
     fn controller(playing: &[&str]) -> (MediaPauseController, Arc<MockBackend>) {
         let backend = MockBackend::new(playing);
-        (MediaPauseController::new(Arc::clone(&backend)), backend)
+        (MediaPauseController::new(backend.clone()), backend)
     }
 
     #[test]
