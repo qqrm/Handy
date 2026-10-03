@@ -208,9 +208,8 @@ fn platform_resume_playback(paused_playback: PausedPlaybackState) -> Result<(), 
 
 #[cfg(target_os = "windows")]
 fn platform_pause_playback() -> Result<Option<PausedPlaybackState>, String> {
-    platform_windows::pause_active_sessions().map(|sessions| {
-        (!sessions.is_empty()).then(|| PausedPlaybackState::Sessions(sessions))
-    })
+    platform_windows::pause_active_sessions()
+        .map(|sessions| (!sessions.is_empty()).then(|| PausedPlaybackState::Sessions(sessions)))
 }
 
 #[cfg(target_os = "windows")]
