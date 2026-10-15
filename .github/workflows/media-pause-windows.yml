@@ -17,6 +17,7 @@ concurrency:
 
 jobs:
   windows-isolated-smtc:
+    name: Windows isolated SMTC (video-only)
     # GitHub-hosted VM, never a self-hosted runner or the developer's desktop.
     runs-on: windows-2025
     timeout-minutes: 10
@@ -47,12 +48,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable
         with:
           toolchain: stable
-      - name: Run both actual SMTC tests exactly once in the isolated VM
+      - name: Run actual enumeration and video-only SMTC checks exactly once
         shell: pwsh
         run: |
           $expectedTests = @(
             'media_pause::tests::windows_enumeration_is_read_only',
-            'media_pause::platform::native_test::isolated_windows_session_pause_resume_and_user_override'
+            'media_pause::platform::native_test::isolated_windows_video_session_pause_resume_and_user_override'
           )
           foreach ($expectedTest in $expectedTests) {
             $testOutput = & cargo test --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml $expectedTest -- --exact --ignored --nocapture --test-threads=1 2>&1

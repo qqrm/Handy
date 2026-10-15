@@ -2,28 +2,36 @@
 //! Only the fixture's own session is passed to the production controller.
 use super::*;
 use std::time::{Duration, Instant};
-use windows::core::{w, HSTRING};
-use windows::Foundation::Uri;
+use windows::core::{w, IInspectable, HSTRING};
+use windows::Foundation::{TimeSpan, Uri};
 use windows::Media::{
     Core::MediaSource,
-    Playback::{MediaPlayer, MediaPlayerFailedEventArgs},
+    Editing::{MediaClip, MediaComposition},
+    MediaProperties::{AudioEncodingProperties, MediaEncodingProfile, VideoEncodingQuality},
+    Playback::{MediaPlaybackState, MediaPlayer, MediaPlayerFailedEventArgs},
 };
+use windows::UI::Color;
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 
 struct Fixture {
     player: MediaPlayer,
-    path: std::path::PathBuf,
+    path: Option<std::path::PathBuf>,
     failure: Arc<Mutex<Option<String>>>,
     failure_token: i64,
+    frames: Arc<AtomicU64>,
+    frame_token: Option<i64>,
+    // The composition must live as long as its generated stream.
+    composition: Option<MediaComposition>,
 }
 impl Fixture {
     fn describe(&self, stage: &str) {
         let failure = self.failure.lock().unwrap().clone();
         match self.player.PlaybackSession() {
             Ok(playback) => eprintln!(
-                "Fixture stage={stage}: playback_state={:?}, position_100ns={:?}, failure={failure:?}",
+                "Fixture stage={stage}: playback_state={:?}, position_100ns={:?}, frames={}, failure={failure:?}",
                 playback.PlaybackState(),
-                playback.Position().map(|position| position.Duration)
+                playback.Position().map(|position| position.Duration),
+                self.frames.load(Ordering::SeqCst)
             ),
             Err(error) => eprintln!("Fixture stage={stage}: PlaybackSession error={error:?}"),
         }
@@ -32,8 +40,13 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = self.player.RemoveMediaFailed(self.failure_token);
+        if let Some(token) = self.frame_token {
+            let _ = self.player.RemoveVideoFrameAvailable(token);
+        }
         let _ = self.player.Close();
-        let _ = std::fs::remove_file(&self.path);
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 struct OnlyFixture(Arc<dyn MediaSession>);
@@ -58,10 +71,62 @@ fn wait_state(fixture: &Fixture, session: &dyn MediaSession, expected: PlaybackS
     fixture.describe(&format!("{stage} complete"));
 }
 
+fn require_progress(fixture: &Fixture, stage: &str) {
+    let playback = fixture.player.PlaybackSession().unwrap();
+    let initial_position = playback.Position().unwrap().Duration;
+    let initial_frames = fixture.frames.load(Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            fixture.failure.lock().unwrap().is_none(),
+            "MediaFailed at {stage}"
+        );
+        let position = playback.Position().unwrap().Duration;
+        let frames = fixture.frames.load(Ordering::SeqCst);
+        if playback.PlaybackState().unwrap() == MediaPlaybackState::Playing
+            && position >= initial_position + 1_000_000
+            && (fixture.composition.is_none() || frames > initial_frames)
+        {
+            eprintln!("Real playback progress at {stage}: position_100ns={initial_position}->{position}, frames={initial_frames}->{frames}");
+            return;
+        }
+        if Instant::now() >= deadline {
+            fixture.describe(stage);
+            panic!("Real playback clock/frame progression missing at {stage}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn require_paused_clock(fixture: &Fixture, stage: &str) {
+    let playback = fixture.player.PlaybackSession().unwrap();
+    assert_eq!(playback.PlaybackState().unwrap(), MediaPlaybackState::Paused);
+    let before = playback.Position().unwrap().Duration;
+    std::thread::sleep(Duration::from_millis(250));
+    let after = playback.Position().unwrap().Duration;
+    assert_eq!(before, after, "Playback clock moved while paused at {stage}");
+    assert!(
+        fixture.failure.lock().unwrap().is_none(),
+        "MediaFailed at {stage}"
+    );
+    eprintln!("Real playback clock paused at {stage}: position_100ns={before}->{after}");
+}
+
 #[test]
 #[ignore = "Restricted to the isolated GitHub-hosted Windows SMTC job"]
 fn isolated_windows_session_pause_resume_and_user_override() {
     require_isolated_smtc_test_environment();
+    run_fixture(false);
+}
+
+#[test]
+#[ignore = "Restricted to the isolated GitHub-hosted Windows SMTC job"]
+fn isolated_windows_video_session_pause_resume_and_user_override() {
+    require_isolated_smtc_test_environment();
+    run_fixture(true);
+}
+
+fn run_fixture(video_only: bool) {
     let _apartment = Apartment::new().expect("WinRT MTA");
     unsafe { SetCurrentProcessExplicitAppUserModelID(w!("Handy.IsolatedSmtcTest")) }.unwrap();
     let player = MediaPlayer::new().unwrap();
@@ -86,13 +151,74 @@ fn isolated_windows_session_pause_resume_and_user_override() {
             }),
         )
         .unwrap();
-    let path = std::env::temp_dir().join(format!("handy-smtc-test-{}.wav", std::process::id()));
-    let fixture = Fixture {
+    let mut fixture = Fixture {
         player,
-        path,
+        path: None,
         failure,
         failure_token,
+        frames: Arc::new(AtomicU64::new(0)),
+        frame_token: None,
+        composition: None,
     };
+    fixture.player.SetVolume(0.0).unwrap();
+    fixture.player.SetIsLoopingEnabled(true).unwrap();
+    if video_only {
+        set_video_source(&mut fixture);
+    } else {
+        set_audio_source(&mut fixture);
+    }
+    exercise_controller(&fixture);
+}
+
+fn set_video_source(fixture: &mut Fixture) {
+    // Built-in Windows video source: no audio track, external codec or driver.
+    let composition = MediaComposition::new().unwrap();
+    let clip = MediaClip::CreateFromColor(
+        Color {
+            A: 255,
+            R: 0,
+            G: 0,
+            B: 0,
+        },
+        TimeSpan {
+            Duration: 300_000_000,
+        },
+    )
+    .unwrap();
+    composition.Clips().unwrap().Append(&clip).unwrap();
+    let profile = MediaEncodingProfile::CreateMp4(VideoEncodingQuality::Wvga).unwrap();
+    profile.SetAudio(None::<&AudioEncodingProperties>).unwrap();
+    let video = profile.Video().unwrap();
+    video.SetWidth(64).unwrap();
+    video.SetHeight(64).unwrap();
+    video.FrameRate().unwrap().SetNumerator(10).unwrap();
+    video.FrameRate().unwrap().SetDenominator(1).unwrap();
+    let stream = composition
+        .GenerateMediaStreamSourceWithProfile(&profile)
+        .unwrap();
+    let frames = fixture.frames.clone();
+    fixture.frame_token = Some(
+        fixture
+            .player
+            .VideoFrameAvailable(&TypedEventHandler::<MediaPlayer, IInspectable>::new(
+                move |_, _| {
+                    frames.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            ))
+            .unwrap(),
+    );
+    fixture.player.SetIsVideoFrameServerEnabled(true).unwrap();
+    fixture
+        .player
+        .SetSource(&MediaSource::CreateFromMediaStreamSource(&stream).unwrap())
+        .unwrap();
+    fixture.composition = Some(composition);
+    eprintln!("Video-only fixture: 64x64 at 10fps, no audio track, built-in Windows composition/frame server");
+}
+
+fn set_audio_source(fixture: &mut Fixture) {
+    let path = std::env::temp_dir().join(format!("handy-smtc-test-{}.wav", std::process::id()));
     let data_len = 8_000u32 * 2 * 10;
     let mut wave = Vec::new();
     wave.extend_from_slice(b"RIFF");
@@ -108,14 +234,10 @@ fn isolated_windows_session_pause_resume_and_user_override() {
     wave.extend_from_slice(b"data");
     wave.extend_from_slice(&data_len.to_le_bytes());
     wave.resize(wave.len() + data_len as usize, 0);
-    std::fs::write(&fixture.path, wave).unwrap();
-    fixture.player.SetVolume(0.0).unwrap();
-    fixture.player.SetIsLoopingEnabled(true).unwrap();
+    std::fs::write(&path, wave).unwrap();
     let uri = Uri::CreateUri(&HSTRING::from(format!(
         "file:///{}",
-        fixture
-            .path
-            .to_string_lossy()
+        path.to_string_lossy()
             .replace('\\', "/")
             .replace(' ', "%20")
     )))
@@ -124,6 +246,11 @@ fn isolated_windows_session_pause_resume_and_user_override() {
         .player
         .SetSource(&MediaSource::CreateFromUri(&uri).unwrap())
         .unwrap();
+    fixture.path = Some(path);
+    eprintln!("Audio-only fixture: silent PCM WAV, requires a Windows audio render endpoint");
+}
+
+fn exercise_controller(fixture: &Fixture) {
     fixture.player.Play().unwrap();
     fixture.describe("initial Play requested, before production controller");
     let manager = SessionManager::RequestAsync().unwrap().get().unwrap();
@@ -146,41 +273,45 @@ fn isolated_windows_session_pause_resume_and_user_override() {
     };
     let session: Arc<dyn MediaSession> = Arc::new(WindowsSession { manager, session });
     wait_state(
-        &fixture,
+        fixture,
         session.as_ref(),
         PlaybackState::Playing,
         "initial fixture playback, before production controller",
     );
+    require_progress(fixture, "initial playback before production controller");
     let controller = MediaPauseController::with_backend(Arc::new(OnlyFixture(session.clone())));
     controller.begin(1);
     controller.apply(1, true, true);
     controller.flush();
     wait_state(
-        &fixture,
+        fixture,
         session.as_ref(),
         PlaybackState::Paused,
         "first controller pause",
     );
+    require_paused_clock(fixture, "first controller pause");
     controller.remove();
     controller.flush();
     wait_state(
-        &fixture,
+        fixture,
         session.as_ref(),
         PlaybackState::Playing,
         "controller restore",
     );
+    require_progress(fixture, "controller restore");
     controller.begin(2);
     controller.apply(2, true, true);
     controller.flush();
     wait_state(
-        &fixture,
+        fixture,
         session.as_ref(),
         PlaybackState::Paused,
         "second controller pause",
     );
+    require_paused_clock(fixture, "second controller pause");
     fixture.player.Play().unwrap();
     wait_state(
-        &fixture,
+        fixture,
         session.as_ref(),
         PlaybackState::Playing,
         "user Play override",
@@ -188,7 +319,7 @@ fn isolated_windows_session_pause_resume_and_user_override() {
     std::thread::sleep(Duration::from_millis(250));
     fixture.player.Pause().unwrap();
     wait_state(
-        &fixture,
+        fixture,
         session.as_ref(),
         PlaybackState::Paused,
         "user Pause override",
@@ -196,5 +327,6 @@ fn isolated_windows_session_pause_resume_and_user_override() {
     controller.remove();
     controller.flush();
     assert_eq!(session.state(), Ok(PlaybackState::Paused));
-    println!("Own silent session: pause/resume and observed user Play→Pause passed; other sessions were not controlled");
+    require_paused_clock(fixture, "user override retained after recording");
+    println!("Own real session: pause/resume and observed user Play→Pause passed; other sessions were not controlled");
 }

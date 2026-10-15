@@ -14,4 +14,4 @@ log = "0.4"
 windows = { version = "=0.61.3", features = ["Media_Control", "Foundation", "Win32_System_WinRT"] }
 
 [target.'cfg(windows)'.dev-dependencies]
-windows = { version = "=0.61.3", features = ["Media_Playback", "Media_Core", "Win32_UI_Shell"] }
+windows = { version = "=0.61.3", features = ["Media_Playback", "Media_Core", "Media_Editing", "Media_MediaProperties", "UI", "Win32_UI_Shell"] }
