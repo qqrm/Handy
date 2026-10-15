@@ -4,15 +4,34 @@ use super::*;
 use std::time::{Duration, Instant};
 use windows::core::{w, HSTRING};
 use windows::Foundation::Uri;
-use windows::Media::{Core::MediaSource, Playback::MediaPlayer};
+use windows::Media::{
+    Core::MediaSource,
+    Playback::{MediaPlayer, MediaPlayerFailedEventArgs},
+};
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 
 struct Fixture {
     player: MediaPlayer,
     path: std::path::PathBuf,
+    failure: Arc<Mutex<Option<String>>>,
+    failure_token: i64,
+}
+impl Fixture {
+    fn describe(&self, stage: &str) {
+        let failure = self.failure.lock().unwrap().clone();
+        match self.player.PlaybackSession() {
+            Ok(playback) => eprintln!(
+                "Fixture stage={stage}: playback_state={:?}, position_100ns={:?}, failure={failure:?}",
+                playback.PlaybackState(),
+                playback.Position().map(|position| position.Duration)
+            ),
+            Err(error) => eprintln!("Fixture stage={stage}: PlaybackSession error={error:?}"),
+        }
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        let _ = self.player.RemoveMediaFailed(self.failure_token);
         let _ = self.player.Close();
         let _ = std::fs::remove_file(&self.path);
     }
@@ -23,15 +42,20 @@ impl MediaBackend for OnlyFixture {
         Ok(vec![self.0.clone()])
     }
 }
-fn wait_state(session: &dyn MediaSession, expected: PlaybackState) {
+fn wait_state(fixture: &Fixture, session: &dyn MediaSession, expected: PlaybackState, stage: &str) {
+    fixture.describe(stage);
     let deadline = Instant::now() + Duration::from_secs(5);
     while session.state() != Ok(expected) {
-        assert!(
-            Instant::now() < deadline,
-            "Fixture did not reach {expected:?}"
-        );
+        if Instant::now() >= deadline {
+            fixture.describe(stage);
+            panic!(
+                "Fixture did not reach {expected:?} at {stage}; SMTC state={:?}",
+                session.state()
+            );
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
+    fixture.describe(&format!("{stage} complete"));
 }
 
 #[test]
@@ -41,8 +65,34 @@ fn isolated_windows_session_pause_resume_and_user_override() {
     let _apartment = Apartment::new().expect("WinRT MTA");
     unsafe { SetCurrentProcessExplicitAppUserModelID(w!("Handy.IsolatedSmtcTest")) }.unwrap();
     let player = MediaPlayer::new().unwrap();
+    let failure = Arc::new(Mutex::new(None));
+    let observed_failure = failure.clone();
+    let failure_token = player
+        .MediaFailed(
+            &TypedEventHandler::<MediaPlayer, MediaPlayerFailedEventArgs>::new(move |_, args| {
+                let details = match args.as_ref() {
+                    Some(args) => format!(
+                        "category={:?}, HRESULT={:?}, message={:?}",
+                        args.Error(),
+                        args.ExtendedErrorCode()
+                            .map(|code| format!("0x{:08X}", code.0 as u32)),
+                        args.ErrorMessage()
+                    ),
+                    None => "MediaFailed event without arguments".into(),
+                };
+                eprintln!("Fixture MediaFailed: {details}");
+                *observed_failure.lock().unwrap() = Some(details);
+                Ok(())
+            }),
+        )
+        .unwrap();
     let path = std::env::temp_dir().join(format!("handy-smtc-test-{}.wav", std::process::id()));
-    let fixture = Fixture { player, path };
+    let fixture = Fixture {
+        player,
+        path,
+        failure,
+        failure_token,
+    };
     let data_len = 8_000u32 * 2 * 10;
     let mut wave = Vec::new();
     wave.extend_from_slice(b"RIFF");
@@ -75,6 +125,7 @@ fn isolated_windows_session_pause_resume_and_user_override() {
         .SetSource(&MediaSource::CreateFromUri(&uri).unwrap())
         .unwrap();
     fixture.player.Play().unwrap();
+    fixture.describe("initial Play requested, before production controller");
     let manager = SessionManager::RequestAsync().unwrap().get().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let session = loop {
@@ -87,31 +138,61 @@ fn isolated_windows_session_pause_resume_and_user_override() {
         if let Some(session) = own {
             break session;
         }
-        assert!(
-            Instant::now() < deadline,
-            "This desktop did not publish the isolated MediaPlayer SMTC session"
-        );
+        if Instant::now() >= deadline {
+            fixture.describe("own SMTC session discovery timed out");
+            panic!("This desktop did not publish the isolated MediaPlayer SMTC session");
+        }
         std::thread::sleep(Duration::from_millis(50));
     };
     let session: Arc<dyn MediaSession> = Arc::new(WindowsSession { manager, session });
-    wait_state(session.as_ref(), PlaybackState::Playing);
+    wait_state(
+        &fixture,
+        session.as_ref(),
+        PlaybackState::Playing,
+        "initial fixture playback, before production controller",
+    );
     let controller = MediaPauseController::with_backend(Arc::new(OnlyFixture(session.clone())));
     controller.begin(1);
     controller.apply(1, true, true);
     controller.flush();
-    wait_state(session.as_ref(), PlaybackState::Paused);
+    wait_state(
+        &fixture,
+        session.as_ref(),
+        PlaybackState::Paused,
+        "first controller pause",
+    );
     controller.remove();
     controller.flush();
-    wait_state(session.as_ref(), PlaybackState::Playing);
+    wait_state(
+        &fixture,
+        session.as_ref(),
+        PlaybackState::Playing,
+        "controller restore",
+    );
     controller.begin(2);
     controller.apply(2, true, true);
     controller.flush();
-    wait_state(session.as_ref(), PlaybackState::Paused);
+    wait_state(
+        &fixture,
+        session.as_ref(),
+        PlaybackState::Paused,
+        "second controller pause",
+    );
     fixture.player.Play().unwrap();
-    wait_state(session.as_ref(), PlaybackState::Playing);
+    wait_state(
+        &fixture,
+        session.as_ref(),
+        PlaybackState::Playing,
+        "user Play override",
+    );
     std::thread::sleep(Duration::from_millis(250));
     fixture.player.Pause().unwrap();
-    wait_state(session.as_ref(), PlaybackState::Paused);
+    wait_state(
+        &fixture,
+        session.as_ref(),
+        PlaybackState::Paused,
+        "user Pause override",
+    );
     controller.remove();
     controller.flush();
     assert_eq!(session.state(), Ok(PlaybackState::Paused));

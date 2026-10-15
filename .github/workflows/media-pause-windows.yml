@@ -38,6 +38,8 @@ jobs:
             audio_services = @(Get-Service Audiosrv, AudioEndpointBuilder | ForEach-Object {
               @{ name = $_.Name; status = $_.Status.ToString(); start_type = $_.StartType.ToString() }
             })
+            sound_devices = @(Get-CimInstance Win32_SoundDevice | Select-Object Name, Manufacturer, Status)
+            audio_endpoints = @(Get-CimInstance Win32_PnPEntity -Filter "PNPClass = 'AudioEndpoint'" | Select-Object Name, Status)
           } | ConvertTo-Json -Depth 4
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
