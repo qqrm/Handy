@@ -4,24 +4,27 @@ This test crate compiles the actual production controller and Windows SMTC
 adapter without the unrelated speech-model and Vulkan build. The Windows CI
 also compiles all application targets with their normal native dependencies.
 
-Run the lifecycle, identity, cancellation, overlap and error tests:
+Run validation remotely through the **Windows media pause** GitHub Actions
+workflow on the reviewed PR commit. Its `windows-native` job runs the lifecycle,
+identity, cancellation, overlap and error tests, then compiles all application
+targets. Its separate `windows-isolated-smtc` job runs both real SMTC checks
+sequentially on a fresh GitHub-hosted `windows-2025` VM. PR updates trigger the
+workflow; inspect both jobs under the PR's Checks tab.
 
-```powershell
-cargo test --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml
-```
-
-On an interactive Windows desktop, explicitly opt into the native checks:
-
-```powershell
-cargo test --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml windows_enumeration_is_read_only -- --ignored --nocapture
-cargo test --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml isolated_windows_session -- --ignored --nocapture --test-threads=1
-```
+**Never run real SMTC checks on a working Windows desktop**, even with a silent
+fixture. Do not create a local VM or spoof the guard variables to bypass this
+restriction. Both checks fail before any WinRT, session enumeration, AUMID or
+MediaPlayer work unless the GitHub-hosted Windows environment and the job's
+explicit `HANDY_RUN_ISOLATED_SMTC_TESTS` opt-in are present. They remain ignored
+in the default test suite. The environment check prevents accidental launches;
+it is not a sandbox. Isolation comes from the remote GitHub-hosted VM.
 
 The second check creates a silent MediaPlayer fixture and passes only that
 fixture's exact session to the production controller. It verifies pause/resume
 and an observed user Play→Pause override, then closes the fixture. It never
-controls other sessions. A desktop unable to publish the fixture fails this
-opt-in test; that is a runtime coverage limit, not a passing hardware check.
+controls other sessions. A hosted VM unable to expose SMTC or publish the
+fixture fails the job. Treat that as a runtime coverage gap; do not skip it or
+replace it with mock results to report a passing native check.
 
 Only sessions playing at recording readiness are paused. Existing paused
 sessions and replacement sessions from the same app are never resumed.

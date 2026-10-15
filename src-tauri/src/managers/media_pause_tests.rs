@@ -301,8 +301,9 @@ fn exit_restores_and_failed_play_does_not_block_other_sessions_or_retry() {
 
 #[cfg(windows)]
 #[test]
-#[ignore = "Requires an interactive Windows desktop; read-only SMTC probe"]
+#[ignore = "Restricted to the isolated GitHub-hosted Windows SMTC job"]
 fn windows_enumeration_is_read_only() {
+    require_isolated_smtc_test_environment();
     let _apartment = platform::Apartment::new().expect("WinRT MTA initialization");
     let sessions = platform::Backend
         .sessions()

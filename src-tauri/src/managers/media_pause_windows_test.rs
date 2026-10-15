@@ -1,5 +1,5 @@
-//! Explicitly opted-in desktop check. Only the fixture's own session is passed
-//! to the production controller; other sessions are never paused or resumed.
+//! Hosted-VM-only desktop check. Never run this on a working desktop.
+//! Only the fixture's own session is passed to the production controller.
 use super::*;
 use std::time::{Duration, Instant};
 use windows::core::{w, HSTRING};
@@ -35,8 +35,9 @@ fn wait_state(session: &dyn MediaSession, expected: PlaybackState) {
 }
 
 #[test]
-#[ignore = "Explicit opt-in: publishes a silent, isolated MediaPlayer SMTC session"]
+#[ignore = "Restricted to the isolated GitHub-hosted Windows SMTC job"]
 fn isolated_windows_session_pause_resume_and_user_override() {
+    require_isolated_smtc_test_environment();
     let _apartment = Apartment::new().expect("WinRT MTA");
     unsafe { SetCurrentProcessExplicitAppUserModelID(w!("Handy.IsolatedSmtcTest")) }.unwrap();
     let player = MediaPlayer::new().unwrap();

@@ -10,6 +10,24 @@ use std::sync::{
 #[path = "media_pause_windows.rs"]
 mod platform;
 
+/// Prevent accidental desktop execution; the hosted VM provides isolation.
+/// Environment values are a fail-closed launch check, not a security sandbox.
+#[cfg(all(test, windows))]
+fn require_isolated_smtc_test_environment() {
+    for (name, expected) in [
+        ("GITHUB_ACTIONS", "true"),
+        ("RUNNER_ENVIRONMENT", "github-hosted"),
+        ("RUNNER_OS", "Windows"),
+        ("HANDY_RUN_ISOLATED_SMTC_TESTS", "1"),
+    ] {
+        assert!(
+            std::env::var(name).is_ok_and(|value| value == expected),
+            "Real SMTC tests are restricted to the isolated GitHub-hosted Windows job: \
+             {name} must be {expected}. Do not run them on a working desktop or spoof these values."
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlaybackState {
     Playing,

@@ -16,6 +16,46 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  windows-isolated-smtc:
+    # GitHub-hosted VM, never a self-hosted runner or the developer's desktop.
+    runs-on: windows-2025
+    timeout-minutes: 10
+    env:
+      HANDY_RUN_ISOLATED_SMTC_TESTS: "1"
+    steps:
+      - name: Describe isolated desktop capabilities
+        shell: pwsh
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          $machine = Get-CimInstance Win32_ComputerSystem
+          [ordered]@{
+            os_caption = $os.Caption
+            os_version = $os.Version
+            session_id = (Get-Process -Id $PID).SessionId
+            user_interactive = [Environment]::UserInteractive
+            manufacturer = $machine.Manufacturer
+            model = $machine.Model
+            audio_services = @(Get-Service Audiosrv, AudioEndpointBuilder | ForEach-Object {
+              @{ name = $_.Name; status = $_.Status.ToString(); start_type = $_.StartType.ToString() }
+            })
+          } | ConvertTo-Json -Depth 4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable
+        with:
+          toolchain: stable
+      - name: Read actual SMTC sessions in the isolated VM
+        run: >-
+          cargo test --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml
+          media_pause::tests::windows_enumeration_is_read_only
+          -- --exact --ignored --nocapture --test-threads=1
+      - name: Verify actual pause, resume and user override in the isolated VM
+        run: >-
+          cargo test --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml
+          media_pause::platform::native_test::isolated_windows_session_pause_resume_and_user_override
+          -- --exact --ignored --nocapture --test-threads=1
+
   windows-native:
     runs-on: windows-2025
     timeout-minutes: 60
