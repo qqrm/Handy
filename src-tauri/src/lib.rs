@@ -1114,6 +1114,9 @@ pub fn run(cli_args: CliArgs) {
         }
         // Teardown transcribe.cpp before exit
         tauri::RunEvent::Exit => {
+            if let Some(audio) = app.try_state::<Arc<AudioRecordingManager>>() {
+                audio.restore_media_before_exit();
+            }
             if let Some(tm) = app.try_state::<Arc<TranscriptionManager>>() {
                 let _ = tm.unload_model();
             }

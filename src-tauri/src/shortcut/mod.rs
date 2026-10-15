@@ -1267,6 +1267,10 @@ pub fn change_pause_media_while_recording_setting(
     let mut settings = settings::get_settings(&app);
     settings.pause_media_while_recording = enabled;
     settings::write_settings(&app, settings);
+    if !enabled {
+        app.state::<std::sync::Arc<crate::managers::audio::AudioRecordingManager>>()
+            .remove_media_pause();
+    }
     Ok(())
 }
 

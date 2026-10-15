@@ -116,6 +116,7 @@ webview2-com = "0.38"
 windows = { version = "0.61.3", features = [
   "Win32_Media_Audio_Endpoints",
   "Media_Control",
+  "Win32_System_WinRT",
   "Foundation",
   "Win32_System_Com_StructuredStorage",
   "Win32_System_DataExchange",
@@ -196,6 +197,9 @@ tempfile = "3"
 # Test-only tokio features for the local socket servers exercising the
 # resumable HTTP downloader; normal builds keep the leaner feature set.
 tokio = { version = "1.43.0", features = ["macros", "net", "io-util", "sync", "time", "rt-multi-thread"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.61.3", features = ["Media_Playback", "Media_Core", "Win32_UI_Shell"] }
 
 [profile.release]
 lto = true

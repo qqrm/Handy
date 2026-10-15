@@ -1,0 +1,61 @@
+name: Windows media pause
+
+on:
+  pull_request:
+    paths: ["src-tauri/**", ".github/workflows/media-pause-windows.yml"]
+  push:
+    branches: [main]
+    paths: ["src-tauri/**", ".github/workflows/media-pause-windows.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: media-pause-windows-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-native:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Test production SMTC adapter and recording lifecycle
+        run: cargo test --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: src-tauri -> target
+          key: windows-native-media-pause
+      # Same native dependencies as the existing Windows release build.
+      - uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff # v1.2
+        with:
+          version: 1.4.309.0
+          cache: false
+      - name: Install SPIRV headers
+        shell: pwsh
+        run: |
+          vcpkg install spirv-headers:x64-windows
+          if ($LASTEXITCODE -ne 0) { throw 'SPIRV headers install failed' }
+          $prefix = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows" -replace '\\','/'
+          Add-Content $env:GITHUB_ENV "CMAKE_PREFIX_PATH=$prefix"
+      - name: Install verified ONNX Runtime
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'ort-1.24.2.zip'
+          Invoke-WebRequest 'https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-x64-1.24.2.zip' -OutFile $archive
+          $expected = '8e3e9c826375352e29cb2614fe44f3d7a4b0ff7b8028ad7a456af9d949a7e8b0'
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'ONNX Runtime checksum mismatch' }
+          $destination = Join-Path $env:RUNNER_TEMP 'ort-1.24.2'
+          Expand-Archive $archive -DestinationPath $destination
+          Add-Content $env:GITHUB_ENV "ORT_LIB_LOCATION=$destination/onnxruntime-win-x64-1.24.2/lib"
+          Add-Content $env:GITHUB_ENV 'ORT_PREFER_DYNAMIC_LINK=1'
+      - name: Compile and lint all Windows application targets
+        working-directory: src-tauri
+        run: cargo clippy --locked --all-targets

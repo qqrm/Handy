@@ -1,0 +1,17 @@
+[package]
+name = "handy-media-pause-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+log = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.61.3", features = ["Media_Control", "Foundation", "Win32_System_WinRT"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "=0.61.3", features = ["Media_Playback", "Media_Core", "Win32_UI_Shell"] }

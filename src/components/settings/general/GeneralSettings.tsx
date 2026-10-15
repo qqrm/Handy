@@ -31,7 +31,9 @@ export const GeneralSettings: React.FC = () => {
         <MicrophoneSelector descriptionMode="tooltip" grouped={true} />
         <ChannelSelector descriptionMode="tooltip" grouped={true} />
         <MuteWhileRecording descriptionMode="tooltip" grouped={true} />
-        <PauseMediaWhileRecording descriptionMode="tooltip" grouped={true} />
+        {type() === "windows" && (
+          <PauseMediaWhileRecording descriptionMode="tooltip" grouped={true} />
+        )}
         <AudioFeedback descriptionMode="tooltip" grouped={true} />
         <OutputDeviceSelector
           descriptionMode="tooltip"
