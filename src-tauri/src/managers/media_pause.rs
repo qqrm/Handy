@@ -123,6 +123,8 @@ enum Command {
     Apply(u64),
     End(u64),
     Barrier(mpsc::Sender<()>),
+    #[cfg(test)]
+    Park(mpsc::Sender<()>, mpsc::Receiver<()>),
 }
 
 struct Sender {
@@ -173,6 +175,11 @@ impl MediaPauseController {
                     }
                 };
                 for command in receiver {
+                    // Even a superseded Begin/End pair must release an older
+                    // recording's sessions before its commands are discarded.
+                    if worker_current.load(Ordering::Acquire) != generation {
+                        restore(&mut paused);
+                    }
                     match command {
                         Command::Begin(next) if worker_current.load(Ordering::Acquire) == next => {
                             restore(&mut paused);
@@ -197,6 +204,13 @@ impl MediaPauseController {
                         }
                         Command::Barrier(done) => {
                             let _ = done.send(());
+                        }
+                        #[cfg(test)]
+                        Command::Park(entered, release) => {
+                            entered.send(()).unwrap();
+                            release
+                                .recv_timeout(std::time::Duration::from_secs(5))
+                                .unwrap();
                         }
                         _ => {}
                     }

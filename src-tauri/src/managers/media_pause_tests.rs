@@ -268,6 +268,23 @@ fn platform_worker_can_start_and_stop_without_touching_sessions() {
 }
 
 #[test]
+fn superseded_start_and_stop_release_the_previous_recording() {
+    let session = Arc::new(FakeSession::new(PlaybackState::Playing));
+    let (c, _) = controller(std::slice::from_ref(&session));
+    start(&c, 1);
+    let (entered, waiting) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    c.0.commands.send(Command::Park(entered, released)).unwrap();
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    c.begin(2);
+    c.remove();
+    release.send(()).unwrap();
+    c.flush();
+    assert_eq!((session.pauses(), session.plays()), (1, 1));
+    assert_eq!(session.state(), Ok(PlaybackState::Playing));
+}
+
+#[test]
 fn exit_restores_and_failed_play_does_not_block_other_sessions_or_retry() {
     let failed = Arc::new(FakeSession {
         play_result: Err("session no longer accepts commands".into()),
