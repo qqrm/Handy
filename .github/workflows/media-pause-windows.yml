@@ -45,16 +45,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable
         with:
           toolchain: stable
-      - name: Read actual SMTC sessions in the isolated VM
-        run: >-
-          cargo test --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml
-          media_pause::tests::windows_enumeration_is_read_only
-          -- --exact --ignored --nocapture --test-threads=1
-      - name: Verify actual pause, resume and user override in the isolated VM
-        run: >-
-          cargo test --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml
-          media_pause::platform::native_test::isolated_windows_session_pause_resume_and_user_override
-          -- --exact --ignored --nocapture --test-threads=1
+      - name: Run both actual SMTC tests exactly once in the isolated VM
+        shell: pwsh
+        run: |
+          $expectedTests = @(
+            'media_pause::tests::windows_enumeration_is_read_only',
+            'media_pause::platform::native_test::isolated_windows_session_pause_resume_and_user_override'
+          )
+          foreach ($expectedTest in $expectedTests) {
+            $testOutput = & cargo test --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml $expectedTest -- --exact --ignored --nocapture --test-threads=1 2>&1
+            $testExitCode = $LASTEXITCODE
+            $testOutput | Write-Output
+            if ($testExitCode -ne 0) { throw "Native test failed: $expectedTest (exit $testExitCode)" }
+            $namePattern = '^test ' + [regex]::Escape($expectedTest) + ' \.\.\.'
+            $namedRuns = @($testOutput | Where-Object { $_ -match $namePattern })
+            $passedRuns = @($testOutput | Where-Object { $_ -match '^test result: ok\. 1 passed; 0 failed; 0 ignored;' })
+            if ($namedRuns.Count -ne 1 -or $passedRuns.Count -ne 1) {
+              throw "Expected exactly one executed, passing native test: $expectedTest; zero matches cannot pass"
+            }
+          }
 
   windows-native:
     runs-on: windows-2025

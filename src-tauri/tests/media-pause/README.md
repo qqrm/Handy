@@ -12,8 +12,9 @@ sequentially on a fresh GitHub-hosted `windows-2025` VM. PR updates trigger the
 workflow; inspect both jobs under the PR's Checks tab.
 
 **Never run real SMTC checks on a working Windows desktop**, even with a silent
-fixture. Do not create a local VM or spoof the guard variables to bypass this
-restriction. Both checks fail before any WinRT, session enumeration, AUMID or
+fixture. Do not spoof the guard variables to bypass this restriction. This
+workflow uses remote VMs to keep build and test load off the working computer.
+Both checks fail before any WinRT, session enumeration, AUMID or
 MediaPlayer work unless the GitHub-hosted Windows environment and the job's
 explicit `HANDY_RUN_ISOLATED_SMTC_TESTS` opt-in are present. They remain ignored
 in the default test suite. The environment check prevents accidental launches;
