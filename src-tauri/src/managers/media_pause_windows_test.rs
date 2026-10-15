@@ -10,8 +10,8 @@ use windows::Media::{
     MediaProperties::{AudioEncodingProperties, MediaEncodingProfile, VideoEncodingQuality},
     Playback::{MediaPlaybackState, MediaPlayer, MediaPlayerFailedEventArgs},
 };
-use windows::UI::Color;
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+use windows::UI::Color;
 
 struct Fixture {
     player: MediaPlayer,
@@ -100,11 +100,17 @@ fn require_progress(fixture: &Fixture, stage: &str) {
 
 fn require_paused_clock(fixture: &Fixture, stage: &str) {
     let playback = fixture.player.PlaybackSession().unwrap();
-    assert_eq!(playback.PlaybackState().unwrap(), MediaPlaybackState::Paused);
+    assert_eq!(
+        playback.PlaybackState().unwrap(),
+        MediaPlaybackState::Paused
+    );
     let before = playback.Position().unwrap().Duration;
     std::thread::sleep(Duration::from_millis(250));
     let after = playback.Position().unwrap().Duration;
-    assert_eq!(before, after, "Playback clock moved while paused at {stage}");
+    assert_eq!(
+        before, after,
+        "Playback clock moved while paused at {stage}"
+    );
     assert!(
         fixture.failure.lock().unwrap().is_none(),
         "MediaFailed at {stage}"
