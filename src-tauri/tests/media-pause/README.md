@@ -22,6 +22,7 @@ fixtures on a working desktop or spoof their hosted-environment guards.
 - **macOS Apple Silicon:** same controller/probe on native ARM, native packaging
   and executable startup. Same exclusions as Intel; building is not playback
   validation.
+
 This list describes the required checks, **not their current pass status**.
 Inspect the exact PR commit's Checks tab. A failed or unavailable native fixture
 is a coverage gap; do not skip it or replace it with mocks and report success.

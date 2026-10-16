@@ -67,6 +67,7 @@ fn completed_operation(result: MediaResult<bool>) -> MediaOperation {
 /// A repeated Pause while already Paused may produce no event and is unknowable.
 #[derive(Default)]
 struct OwnershipState {
+    revision: u64,
     pause_observed: bool,
     lost: bool,
     resumed: bool,
@@ -78,6 +79,11 @@ struct PauseOwnership(Mutex<OwnershipState>);
 impl PauseOwnership {
     fn observe(&self, state: MediaResult<PlaybackState>) {
         let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Self::record(&mut guard, state);
+    }
+
+    fn record(guard: &mut OwnershipState, state: MediaResult<PlaybackState>) {
+        guard.revision = guard.revision.wrapping_add(1);
         match state {
             Ok(PlaybackState::Paused) => guard.pause_observed = true,
             Ok(PlaybackState::Playing) if !guard.pause_observed => {}
@@ -87,6 +93,21 @@ impl PauseOwnership {
             }
             _ => guard.lost = true,
         }
+    }
+
+    /// Do not replay a Get snapshot after a newer subscription event. Never
+    /// hold the ownership lock across IPC: a backend may fence its event stream
+    /// before returning. None also prevents a stale snapshot authorizing a
+    /// command or releasing an unresolved lease; the next poll can read again.
+    fn snapshot(&self, session: &dyn MediaSession) -> Option<MediaResult<PlaybackState>> {
+        let revision = self.0.lock().unwrap_or_else(|e| e.into_inner()).revision;
+        let state = session.state();
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.revision != revision {
+            return None;
+        }
+        Self::record(&mut guard, state.clone());
+        Some(state)
     }
 
     fn can_resume(&self) -> bool {
@@ -146,8 +167,7 @@ impl PausedSession {
         if let Err(error) = live {
             self.ownership.observe(Err(error));
         }
-        let state = self.session.state();
-        self.ownership.observe(state.clone());
+        let state = self.ownership.snapshot(self.session.as_ref());
 
         if let Some(operation) = self.pause.as_mut() {
             match operation() {
@@ -176,7 +196,7 @@ impl PausedSession {
             // Play has the same reply/state race as Pause. Do not allow a new
             // recording to pause ahead of the previous delayed resume. Keep
             // the observed transition even if the user has already paused again.
-            if self.ownership.resume_observed() || state == Ok(PlaybackState::Other) {
+            if self.ownership.resume_observed() || state == Some(Ok(PlaybackState::Other)) {
                 return true;
             }
             self.mark_quarantine();
@@ -191,7 +211,7 @@ impl PausedSession {
             self.mark_quarantine();
             return false;
         }
-        if self.retiring && state == Ok(PlaybackState::Paused) {
+        if self.retiring && state == Some(Ok(PlaybackState::Paused)) {
             match self.session.play() {
                 Ok(operation) => {
                     self.play = Some(operation);
@@ -253,7 +273,8 @@ fn pause_sessions(
             continue;
         };
         if current.load(Ordering::Acquire) != generation
-            || session.state() != Ok(PlaybackState::Playing)
+            || ownership.snapshot(session.as_ref()) != Some(Ok(PlaybackState::Playing))
+            || ownership.lost()
         {
             continue;
         }
@@ -261,7 +282,7 @@ fn pause_sessions(
             Ok(operation) => operation,
             Err(_) => continue,
         };
-        ownership.observe(session.state());
+        let _ = ownership.snapshot(session.as_ref());
         paused.push(PausedSession {
             session,
             ownership,

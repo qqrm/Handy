@@ -190,19 +190,13 @@ fn wait_state(session: &Session, expected: PlaybackState, stage: &str) {
     }
 }
 
-fn complete(mut operation: MediaOperation) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(result) = operation() {
-            assert_eq!(result, Ok(true));
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "MPRIS operation did not acknowledge"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+fn user_command(session: &Session, method: &str) {
+    // Simulate an external user explicitly, outside automatic resume ownership.
+    bounded(SETUP_TIMEOUT, async {
+        session.proxy().await.map_err(error)?
+            .call_method(method, &()).await.map_err(error)?;
+        Ok(())
+    }).unwrap();
 }
 
 fn position(session: &Session) -> i64 {
@@ -270,7 +264,7 @@ fn isolated_linux_vlc_pause_resume_override_and_replacement() {
     let mut second = Fixture::spawn("second");
     let b = second.session();
     require_progress(&b, "initial second");
-    complete(b.pause().unwrap());
+    user_command(&b, "Pause");
     require_paused_clock(&b, "initially paused player");
 
     let controller =
@@ -281,7 +275,7 @@ fn isolated_linux_vlc_pause_resume_override_and_replacement() {
     require_progress(&a, "recording ended");
     require_paused_clock(&b, "initially paused player remains paused");
 
-    complete(b.play().unwrap());
+    user_command(&b, "Play");
     require_progress(&b, "second playing");
     start(&controller, 2);
     require_paused_clock(&a, "both players recording first");
@@ -289,20 +283,20 @@ fn isolated_linux_vlc_pause_resume_override_and_replacement() {
     controller.remove();
     require_progress(&a, "both players restored first");
     require_progress(&b, "both players restored second");
-    complete(b.pause().unwrap());
+    user_command(&b, "Pause");
     require_paused_clock(&b, "second manually paused");
 
     start(&controller, 3);
     require_paused_clock(&a, "before user override");
-    complete(a.play().unwrap());
+    user_command(&a, "Play");
     require_progress(&a, "user resumed");
-    complete(a.pause().unwrap());
+    user_command(&a, "Pause");
     require_paused_clock(&a, "user paused again");
     controller.remove();
     std::thread::sleep(Duration::from_millis(200));
     require_paused_clock(&a, "user pause preserved after recording");
 
-    complete(a.play().unwrap());
+    user_command(&a, "Play");
     require_progress(&a, "before replacement");
     start(&controller, 4);
     require_paused_clock(&a, "old owner recording");
@@ -315,7 +309,7 @@ fn isolated_linux_vlc_pause_resume_override_and_replacement() {
         "Replacement must have a different D-Bus connection"
     );
     assert_eq!(a.is_live(), Ok(false));
-    complete(c.pause().unwrap());
+    user_command(&c, "Pause");
     require_paused_clock(&c, "replacement manually paused");
     controller.remove();
     std::thread::sleep(Duration::from_millis(200));
@@ -332,12 +326,28 @@ fn mpris_playback_status_rejects_unknown_values() {
     assert!(playback_state("").is_err());
 }
 
+#[test]
+fn mpris_full_fence_queue_revokes_ownership() {
+    let ownership = Arc::new(PauseOwnership::default());
+    ownership.observe(Ok(PlaybackState::Paused));
+    let (fences, _receiver) = async_mpsc::channel(1);
+    let (queued, _reply) = oneshot::channel();
+    fences.try_send(queued).unwrap();
+    let watch = WatchControl {
+        fences,
+        ownership: ownership.clone(),
+    };
+    assert!(bounded(READ_TIMEOUT, watch.synchronize()).is_err());
+    assert!(!ownership.can_resume());
+}
+
 // These protocol tests supplement the real VLC test. They do not substitute a
 // simulated player for proof that a real decoder's clock pauses and resumes.
 struct ProtocolState {
     status: AtomicU64,
     pause_started: mpsc::Sender<()>,
     pause_gate: Mutex<Option<oneshot::Receiver<()>>>,
+    play_preflight: Mutex<Option<(mpsc::Sender<()>, oneshot::Receiver<()>)>>,
     pause_calls: AtomicU64,
     play_calls: AtomicU64,
 }
@@ -366,7 +376,12 @@ impl ProtocolPlayer {
     }
 
     #[zbus(property)]
-    fn can_play(&self) -> bool {
+    async fn can_play(&self) -> bool {
+        let gate = self.0.play_preflight.lock().unwrap().take();
+        if let Some((started, release)) = gate {
+            let _ = started.send(());
+            let _ = release.await;
+        }
         true
     }
 
@@ -433,6 +448,7 @@ fn isolated_linux_dbus_delayed_ack_and_signal_ownership() {
         status: AtomicU64::new(0),
         pause_started,
         pause_gate: Mutex::new(Some(gate)),
+        play_preflight: Mutex::new(None),
         pause_calls: AtomicU64::new(0),
         play_calls: AtomicU64::new(0),
     });
@@ -485,6 +501,27 @@ fn isolated_linux_dbus_delayed_ack_and_signal_ownership() {
     controller.restore_before_exit();
     drop(controller);
 
+    // The controller has already authorized restoration when CanPlay blocks.
+    // User intent observed during that preflight must still cancel AUTO Play.
+    let controller =
+        MediaPauseController::with_backend(Arc::new(OnlyFixtures(vec![session.clone()])));
+    start(&controller, 102);
+    wait_state(&session, PlaybackState::Paused, "before gated resume preflight");
+    started.recv_timeout(Duration::from_secs(3)).expect("Preflight scenario Pause reached service");
+    let (preflight_started, preflight) = mpsc::channel();
+    let (release_preflight, gate) = oneshot::channel();
+    *state.play_preflight.lock().unwrap() = Some((preflight_started, gate));
+    controller.remove();
+    preflight.recv_timeout(Duration::from_secs(3)).expect("Auto Play reached CanPlay preflight");
+    emit_status(&connection, &state, 0);
+    emit_status(&connection, &state, 1);
+    release_preflight.send(()).unwrap();
+    controller.restore_before_exit();
+    drop(controller);
+    assert_eq!(state.status.load(Ordering::SeqCst), 1);
+    assert_eq!(state.pause_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(state.play_calls.load(Ordering::SeqCst), 1, "User override during preflight forbids automatic Play");
+
     let ownership = Arc::new(PauseOwnership::default());
     let watch = session.watch(ownership.clone()).unwrap();
     emit_status(&connection, &state, 1);
@@ -520,6 +557,7 @@ fn isolated_linux_dbus_delayed_ack_and_signal_ownership() {
         status: AtomicU64::new(0),
         pause_started: replacement_started,
         pause_gate: Mutex::new(None),
+        play_preflight: Mutex::new(None),
         pause_calls: AtomicU64::new(0),
         play_calls: AtomicU64::new(0),
     });
@@ -559,7 +597,7 @@ fn isolated_linux_dbus_delayed_ack_and_signal_ownership() {
     start(&controller, 202);
     std::thread::sleep(Duration::from_millis(1250));
     controller.flush();
-    assert_eq!(state.pause_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(state.pause_calls.load(Ordering::SeqCst), 3);
     assert_eq!(
         state.play_calls.load(Ordering::SeqCst),
         1,
@@ -587,7 +625,7 @@ fn isolated_linux_dbus_delayed_ack_and_signal_ownership() {
     }
     controller.restore_before_exit();
     drop(controller);
-    assert_eq!(state.pause_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(state.pause_calls.load(Ordering::SeqCst), 3);
     assert_eq!(state.play_calls.load(Ordering::SeqCst), 1);
     assert_eq!(replacement_state.pause_calls.load(Ordering::SeqCst), 0);
     assert_eq!(replacement_state.play_calls.load(Ordering::SeqCst), 0);

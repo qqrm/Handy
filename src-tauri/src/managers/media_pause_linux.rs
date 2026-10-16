@@ -38,10 +38,7 @@ fn runtime() -> MediaResult<&'static Runtime> {
         .map_err(Clone::clone)
 }
 
-fn bounded<T>(
-    deadline: Duration,
-    future: impl Future<Output = MediaResult<T>>,
-) -> MediaResult<T> {
+fn bounded<T>(deadline: Duration, future: impl Future<Output = MediaResult<T>>) -> MediaResult<T> {
     runtime()?.block_on(async {
         tokio::time::timeout(deadline, future)
             .await
@@ -156,28 +153,29 @@ impl Session {
             .unwrap_or_else(|e| e.into_inner())
             .upgrade();
         if let Some(watch) = watch {
-            bounded(READ_TIMEOUT, async {
-                let (done, result) = oneshot::channel();
-                watch
-                    .fences
-                    .send(done)
-                    .map_err(|_| "MPRIS observer stopped".to_string())?;
-                result
-                    .await
-                    .map_err(|_| "MPRIS observer stopped".to_string())
-            })?;
+            bounded(READ_TIMEOUT, watch.synchronize())?;
         }
         Ok(())
     }
 
-    fn command(&self, method: &'static str, capability: &'static str) -> MediaResult<MediaOperation> {
+    fn command(
+        &self,
+        method: &'static str,
+        capability: &'static str,
+    ) -> MediaResult<MediaOperation> {
         if !self.owns_service_name()? {
             return Ok(completed_operation(Ok(false)));
         }
         let allowed = bounded(READ_TIMEOUT, async {
             let proxy = self.proxy().await.map_err(error)?;
-            Ok(proxy.get_property::<bool>("CanControl").await.map_err(error)?
-                && proxy.get_property::<bool>(capability).await.map_err(error)?)
+            Ok(proxy
+                .get_property::<bool>("CanControl")
+                .await
+                .map_err(error)?
+                && proxy
+                    .get_property::<bool>(capability)
+                    .await
+                    .map_err(error)?)
         })?;
         if !allowed || !self.owns_service_name()? {
             return Ok(completed_operation(Ok(false)));
@@ -186,6 +184,11 @@ impl Session {
         let connection = self.connection.clone();
         let owner = self.owner.clone();
         let service = self.service.clone();
+        let play_watch = if method == "Play" {
+            self.watch.lock().unwrap_or_else(|e| e.into_inner()).upgrade()
+        } else {
+            None
+        };
         let (done, receiver) = mpsc::channel();
         let task = runtime()?.spawn(async move {
             // Recheck in the task as well: it may be scheduled after the caller
@@ -201,14 +204,25 @@ impl Session {
                     Err(problem) => return Err(problem.to_string()),
                 }
                 let proxy: Proxy<'static> = zbus::proxy::Builder::new(&connection)
-                    .destination(owner).map_err(error)?
-                    .path(PATH).map_err(error)?
-                    .interface(PLAYER).map_err(error)?
+                    .destination(owner)
+                    .map_err(error)?
+                    .path(PATH)
+                    .map_err(error)?
+                    .interface(PLAYER)
+                    .map_err(error)?
                     .cache_properties(CacheProperties::No)
                     .build()
-                    .await.map_err(error)?;
+                    .await
+                    .map_err(error)?;
+                if let Some(watch) = &play_watch {
+                    watch.synchronize().await?;
+                    if !watch.ownership.can_resume() {
+                        return Ok(None);
+                    }
+                }
                 Ok(Some(proxy))
-            }).await;
+            })
+            .await;
             let proxy = match prepared {
                 Ok(Ok(Some(proxy))) => proxy,
                 Ok(Ok(None)) => {
@@ -220,10 +234,18 @@ impl Session {
                     return;
                 }
                 Err(_) => {
-                    let _ = done.send(Err("MPRIS command identity check timed out before submission".into()));
+                    let _ = done.send(Err(
+                        "MPRIS command identity check timed out before submission".into(),
+                    ));
                     return;
                 }
             };
+            // Capability/identity requests and observer synchronization can yield
+            // to a user's Play -> Pause. Revalidate at the actual dispatch point.
+            if play_watch.as_ref().is_some_and(|watch| !watch.ownership.can_resume()) {
+                let _ = done.send(Ok(false));
+                return;
+            }
             let result = proxy.call_method(method, &()).await;
             // A reply acknowledges the method, not the playback transition.
             // Never turn a timeout/disconnection into a known failed command:
@@ -325,16 +347,20 @@ impl MediaSession for Session {
                 .add_arg(self.service.as_str())
                 .map_err(error)?
                 .build();
-            let properties = MessageStream::for_match_rule(property_rule, &self.connection, Some(128))
-                .await
-                .map_err(error)?;
+            let properties =
+                MessageStream::for_match_rule(property_rule, &self.connection, Some(128))
+                    .await
+                    .map_err(error)?;
             let owners = MessageStream::for_match_rule(owner_rule, &self.connection, Some(8))
                 .await
                 .map_err(error)?;
             Ok((properties, owners))
         })?;
-        let (fences, receiver) = async_mpsc::unbounded_channel();
-        let control = Arc::new(WatchControl { fences });
+        let (fences, receiver) = async_mpsc::channel(32);
+        let control = Arc::new(WatchControl {
+            fences,
+            ownership: ownership.clone(),
+        });
         *self.watch.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(&control);
         let task = runtime()?.spawn(observe(properties, owners, receiver, ownership));
         Ok(Box::new(Watch {
@@ -345,7 +371,20 @@ impl MediaSession for Session {
 }
 
 struct WatchControl {
-    fences: async_mpsc::UnboundedSender<oneshot::Sender<()>>,
+    fences: async_mpsc::Sender<oneshot::Sender<()>>,
+    ownership: Arc<PauseOwnership>,
+}
+
+impl WatchControl {
+    async fn synchronize(&self) -> MediaResult<()> {
+        let (done, result) = oneshot::channel();
+        if self.fences.try_send(done).is_err() {
+            let problem = "MPRIS observer stopped or its bounded fence queue is full".to_string();
+            self.ownership.observe(Err(problem.clone()));
+            return Err(problem);
+        }
+        result.await.map_err(|_| "MPRIS observer stopped".to_string())
+    }
 }
 
 struct Watch {
@@ -364,7 +403,7 @@ impl Drop for Watch {
 async fn observe(
     mut properties: MessageStream,
     mut owners: MessageStream,
-    mut fences: async_mpsc::UnboundedReceiver<oneshot::Sender<()>>,
+    mut fences: async_mpsc::Receiver<oneshot::Sender<()>>,
     ownership: Arc<PauseOwnership>,
 ) {
     loop {

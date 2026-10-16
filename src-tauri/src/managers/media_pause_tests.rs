@@ -15,6 +15,8 @@ struct FakeSession {
     pause_calls: AtomicUsize,
     play_calls: AtomicUsize,
     pause_gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    events_during_snapshot: Mutex<Vec<MediaResult<PlaybackState>>>,
+    pause_ack_during_snapshot: bool,
     defer_pause_state: bool,
     defer_play_state: bool,
     pause_completion: Option<Completion>,
@@ -33,6 +35,8 @@ impl FakeSession {
             pause_calls: AtomicUsize::new(0),
             play_calls: AtomicUsize::new(0),
             pause_gate: Mutex::new(None),
+            events_during_snapshot: Mutex::new(Vec::new()),
+            pause_ack_during_snapshot: false,
             defer_pause_state: false,
             defer_play_state: false,
             pause_completion: None,
@@ -57,7 +61,12 @@ struct FakeWatch;
 impl SessionWatch for FakeWatch {}
 impl MediaSession for FakeSession {
     fn state(&self) -> MediaResult<PlaybackState> {
-        self.state.lock().unwrap().clone()
+        let snapshot = self.state.lock().unwrap().clone();
+        let events = std::mem::take(&mut *self.events_during_snapshot.lock().unwrap());
+        for event in events {
+            self.change(event);
+        }
+        snapshot
     }
     fn is_live(&self) -> MediaResult<bool> {
         Ok(self.live.load(Ordering::SeqCst))
@@ -68,8 +77,12 @@ impl MediaSession for FakeSession {
             entered.send(()).unwrap();
             release.recv_timeout(Duration::from_secs(5)).unwrap();
         }
-        if self.pause_result == Ok(true) && !self.defer_pause_state {
-            self.change(Ok(PlaybackState::Paused));
+        if self.pause_result == Ok(true) {
+            if self.pause_ack_during_snapshot {
+                *self.events_during_snapshot.lock().unwrap() = vec![Ok(PlaybackState::Paused)];
+            } else if !self.defer_pause_state {
+                self.change(Ok(PlaybackState::Paused));
+            }
         }
         if let Some(completion) = &self.pause_completion {
             let completion = completion.clone();
@@ -352,6 +365,55 @@ fn accepted_pause_with_late_state_after_end_is_restored_once() {
     assert_eq!((session.pauses(), session.plays()), (1, 1));
     c.flush();
     assert_eq!(session.plays(), 1);
+}
+
+#[test]
+fn post_pause_snapshot_cannot_overwrite_newer_pause_acknowledgement() {
+    let session = Arc::new(FakeSession {
+        pause_ack_during_snapshot: true,
+        ..FakeSession::new(PlaybackState::Playing)
+    });
+    let (c, _) = controller(std::slice::from_ref(&session));
+    // The Get captures Playing, then the subscription observes our Paused event
+    // before that older Get returns (for example, during a D-Bus signal fence).
+    start(&c, 1);
+    assert_eq!(session.state(), Ok(PlaybackState::Paused));
+    stop(&c);
+    assert_eq!((session.pauses(), session.plays()), (1, 1));
+}
+
+#[test]
+fn progress_snapshot_cannot_overwrite_newer_pause_acknowledgement() {
+    let session = Arc::new(FakeSession {
+        defer_pause_state: true,
+        ..FakeSession::new(PlaybackState::Playing)
+    });
+    let backend = FakeBackend(Mutex::new(Ok(vec![session.clone()])));
+    let mut leases = pause_sessions(&backend, &AtomicU64::new(1), 1);
+    assert_eq!(leases.len(), 1);
+    leases[0].retiring = true;
+    *session.events_during_snapshot.lock().unwrap() = vec![Ok(PlaybackState::Paused)];
+    assert!(!leases[0].progress());
+    assert!(leases[0].ownership.can_resume());
+    assert_eq!(session.plays(), 0, "Do not act on the stale returned state");
+    assert!(!leases[0].progress());
+    assert_eq!(session.plays(), 1);
+    assert!(leases[0].progress());
+    assert_eq!(session.state(), Ok(PlaybackState::Playing));
+}
+
+#[test]
+fn user_override_during_snapshot_still_relinquishes_resume() {
+    let session = Arc::new(FakeSession::new(PlaybackState::Playing));
+    let backend = FakeBackend(Mutex::new(Ok(vec![session.clone()])));
+    let mut leases = pause_sessions(&backend, &AtomicU64::new(1), 1);
+    assert_eq!(leases.len(), 1);
+    leases[0].retiring = true;
+    *session.events_during_snapshot.lock().unwrap() =
+        vec![Ok(PlaybackState::Playing), Ok(PlaybackState::Paused)];
+    assert!(leases[0].progress());
+    assert_eq!(session.plays(), 0);
+    assert_eq!(session.state(), Ok(PlaybackState::Paused));
 }
 
 #[test]
