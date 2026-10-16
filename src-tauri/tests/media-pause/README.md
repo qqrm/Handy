@@ -89,8 +89,13 @@ The separate **Fork artifact packaging** workflow builds test packages without
 release credentials, publication, or retained installers. Both macOS targets
 are built on ARM to catch build-script host/target confusion. The audit checks
 Mach-O architecture, ad-hoc signature, absence of updater signatures, and
-bounded startup of the packaged `--list-devices` executable. Ad-hoc packages
-are test outputs, not signed/notarized distribution releases.
+bounded startup of the packaged executable: help within 30 seconds, first device
+enumeration within 120 seconds for cold Metal shader compilation, and a repeat
+within 30 seconds with identical device identities including CPU. A timeout retains
+a process stack diagnostic and fails the job. The separate cold budget follows
+[a measured 31.450-second Metal compile](https://github.com/qqrm/Handy/actions/runs/38931717338/job/117077161441),
+which completed enumeration after the original 30-second gate had expired.
+Ad-hoc packages are test outputs, not signed/notarized distribution releases.
 
 ## Upstream comparison
 
@@ -113,3 +118,17 @@ browser JavaScript. Its Linux `dbus-send` fallback omits method-call mode, so a
 successful tool exit does not establish that Pause/Play was invoked. The fork
 uses direct typed D-Bus method calls. macOS generality remains an open product
 choice; the QuickTime probe is not a claim of parity with all its targets.
+
+Public Apple Events alone do not make every player a suitable adapter. VLC's
+[reviewed macOS AppleScript `play` handler](https://github.com/videolan/vlc/blob/3.0.x/modules/gui/macosx/applescript.m)
+toggles playback; reading its state before a toggle does not make an explicit
+Pause/Play operation race-free.
+Music/Spotify track identifiers describe content, not a playback generation;
+their actual playback and current application dictionaries remain unvalidated.
+QuickTime is the only public macOS transport exercised by this change. Polling
+cannot reconstruct Play/Pause transitions between reads, and
+[distributed notifications](https://developer.apple.com/documentation/foundation/distributednotificationcenter)
+can be delayed or dropped. A future macOS backend therefore needs
+an explicit supported-player list and documented best-effort resume semantics;
+pause without automatic resume is the alternative when those limits are not
+acceptable. No adapter should reopen a saved track or launch a closed player.

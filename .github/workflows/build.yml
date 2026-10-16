@@ -599,19 +599,27 @@ jobs:
           python3 - "$binary" <<'PY'
           import os
           from pathlib import Path
+          import re
           import subprocess
           import sys
+          import time
           environment = {**os.environ, "RUST_LOG": "info"}
-          for argument in ("--help", "--list-devices"):
-              print(f"Checking packaged executable {argument}", flush=True)
+          expected_devices = None
+          # A fresh hosted ARM VM took 31.450s compiling Metal libraries, then
+          # completed enumeration. Allow cold shader compilation explicitly;
+          # require the repeat launch to satisfy the original short deadline.
+          checks = (("help", "--help", 30), ("cold", "--list-devices", 120), ("warm", "--list-devices", 30))
+          for phase, argument, deadline in checks:
+              print(f"Checking packaged executable {argument} ({phase}, limit={deadline}s)", flush=True)
+              started = time.monotonic()
               process = subprocess.Popen([sys.argv[1], argument], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment)
               try:
-                  stdout, stderr = process.communicate(timeout=30)
+                  stdout, stderr = process.communicate(timeout=deadline)
               except subprocess.TimeoutExpired:
                   # Inspect only this job's own disposable test process. Keep
                   # the failed runtime gate; a built/signed package is not proof
                   # that the application initializes and exits successfully.
-                  sample = Path(os.environ["RUNNER_TEMP"]) / "handy-startup-sample.txt"
+                  sample = Path(os.environ["RUNNER_TEMP"]) / f"handy-startup-{phase}-sample.txt"
                   try:
                       diagnostic = subprocess.run(["/usr/bin/sample", str(process.pid), "3", "-file", str(sample)], timeout=10, capture_output=True, text=True)
                       print(diagnostic.stdout, diagnostic.stderr, flush=True)
@@ -623,10 +631,23 @@ jobs:
                       print(stdout, stderr, flush=True)
                   raise
               print(stdout, stderr, flush=True)
+              print(f"Packaged executable {phase}: {time.monotonic() - started:.3f}s, exit={process.returncode}", flush=True)
               if process.returncode != 0:
                   raise SystemExit(f"Packaged executable failed {argument}: exit {process.returncode}")
               if argument == "--help" and not all(expected in stdout for expected in ("Usage:", "--list-devices")):
                   raise SystemExit("Packaged executable did not return the expected CLI help")
+              if argument == "--list-devices":
+                  entries = [line.strip() for line in stdout.splitlines() if line.strip().startswith("index=")]
+                  matches = [re.fullmatch(r"index=(\S+) kind=(\S+) name=(.+) vram=\d+MB", entry) for entry in entries]
+                  if not entries or any(match is None for match in matches):
+                      raise SystemExit("Packaged executable returned invalid compute-device entries")
+                  # Available/advisory memory may change; identity must not.
+                  devices = [match.groups() for match in matches]
+                  if "transcribe-cpp compute devices:" not in stdout or not any(device[1] == "cpu" for device in devices):
+                      raise SystemExit("Packaged executable did not enumerate its CPU backend")
+                  if expected_devices is not None and devices != expected_devices:
+                      raise SystemExit("Cold and warm launches enumerated different compute devices")
+                  expected_devices = devices
           print("Verified packaged macOS executable starts without signing credentials.")
           PY
 
