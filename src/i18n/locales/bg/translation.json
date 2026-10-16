@@ -535,6 +535,10 @@
         "label": "Заглушаване при запис",
         "description": "Заглушаване на системния звук по време на запис"
       },
+      "pauseMediaWhileRecording": {
+        "label": "Pause Media While Recording",
+        "description": "Pause currently playing media during recording and resume it afterwards"
+      },
       "appendTrailingSpace": {
         "label": "Интервал в края",
         "description": "Добавяне на интервал след поставената транскрипция"

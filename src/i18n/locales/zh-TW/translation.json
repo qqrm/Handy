@@ -535,6 +535,10 @@
         "label": "錄製時靜音",
         "description": "錄製期間靜音系統音訊"
       },
+      "pauseMediaWhileRecording": {
+        "label": "Pause Media While Recording",
+        "description": "Pause currently playing media during recording and resume it afterwards"
+      },
       "appendTrailingSpace": {
         "label": "附加尾部空格",
         "description": "在貼上的轉錄後新增空格"

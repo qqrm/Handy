@@ -93,6 +93,10 @@ pub fn cancel_current_operation(app: &AppHandle) {
     let audio_manager = app.state::<Arc<AudioRecordingManager>>();
     let recording_was_active = audio_manager.is_recording();
     audio_manager.cancel_recording();
+    // Resume media paused for the recording: cancel has no later stream
+    // lifecycle hook in always-on / lazy-close modes, so this is the only
+    // place that reliably unpauses on cancel.
+    audio_manager.remove_media_pause();
 
     // Abandon any live streaming transcription
     let tm = app.state::<Arc<TranscriptionManager>>();

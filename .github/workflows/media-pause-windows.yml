@@ -1,0 +1,113 @@
+name: Windows media pause
+
+on:
+  pull_request:
+    paths: ["src-tauri/**", ".github/workflows/media-pause-windows.yml"]
+  push:
+    branches: [main]
+    paths: ["src-tauri/**", ".github/workflows/media-pause-windows.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: media-pause-windows-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-isolated-smtc:
+    name: Windows isolated SMTC (video-only)
+    # GitHub-hosted VM, never a self-hosted runner or the developer's desktop.
+    runs-on: windows-2025
+    timeout-minutes: 10
+    env:
+      HANDY_RUN_ISOLATED_SMTC_TESTS: "1"
+    steps:
+      - name: Describe isolated desktop capabilities
+        shell: pwsh
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          $machine = Get-CimInstance Win32_ComputerSystem
+          [ordered]@{
+            os_caption = $os.Caption
+            os_version = $os.Version
+            session_id = (Get-Process -Id $PID).SessionId
+            user_interactive = [Environment]::UserInteractive
+            manufacturer = $machine.Manufacturer
+            model = $machine.Model
+            audio_services = @(Get-Service Audiosrv, AudioEndpointBuilder | ForEach-Object {
+              @{ name = $_.Name; status = $_.Status.ToString(); start_type = $_.StartType.ToString() }
+            })
+            sound_devices = @(Get-CimInstance Win32_SoundDevice | Select-Object Name, Manufacturer, Status)
+            audio_endpoints = @(Get-CimInstance Win32_PnPEntity -Filter "PNPClass = 'AudioEndpoint'" | Select-Object Name, Status)
+          } | ConvertTo-Json -Depth 4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable
+        with:
+          toolchain: stable
+      - name: Run actual enumeration and video-only SMTC checks exactly once
+        shell: pwsh
+        run: |
+          $expectedTests = @(
+            'media_pause::tests::windows_enumeration_is_read_only',
+            'media_pause::platform::native_test::isolated_windows_video_session_pause_resume_and_user_override'
+          )
+          foreach ($expectedTest in $expectedTests) {
+            $testOutput = & cargo test --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml $expectedTest -- --exact --ignored --nocapture --test-threads=1 2>&1
+            $testExitCode = $LASTEXITCODE
+            $testOutput | Write-Output
+            if ($testExitCode -ne 0) { throw "Native test failed: $expectedTest (exit $testExitCode)" }
+            $namePattern = '^test ' + [regex]::Escape($expectedTest) + ' \.\.\.'
+            $namedRuns = @($testOutput | Where-Object { $_ -match $namePattern })
+            $passedRuns = @($testOutput | Where-Object { $_ -match '^test result: ok\. 1 passed; 0 failed; 0 ignored;' })
+            if ($namedRuns.Count -ne 1 -or $passedRuns.Count -ne 1) {
+              throw "Expected exactly one executed, passing native test: $expectedTest; zero matches cannot pass"
+            }
+          }
+
+  windows-native:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Test production SMTC adapter and recording lifecycle
+        run: cargo test --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: src-tauri -> target
+          key: windows-native-media-pause
+      # Same native dependencies as the existing Windows release build.
+      - uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff # v1.2
+        with:
+          version: 1.4.309.0
+          cache: false
+      - name: Install SPIRV headers
+        shell: pwsh
+        run: |
+          vcpkg install spirv-headers:x64-windows
+          if ($LASTEXITCODE -ne 0) { throw 'SPIRV headers install failed' }
+          $prefix = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows" -replace '\\','/'
+          Add-Content $env:GITHUB_ENV "CMAKE_PREFIX_PATH=$prefix"
+      - name: Install verified ONNX Runtime
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'ort-1.24.2.zip'
+          Invoke-WebRequest 'https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-x64-1.24.2.zip' -OutFile $archive
+          $expected = '8e3e9c826375352e29cb2614fe44f3d7a4b0ff7b8028ad7a456af9d949a7e8b0'
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'ONNX Runtime checksum mismatch' }
+          $destination = Join-Path $env:RUNNER_TEMP 'ort-1.24.2'
+          Expand-Archive $archive -DestinationPath $destination
+          Add-Content $env:GITHUB_ENV "ORT_LIB_LOCATION=$destination/onnxruntime-win-x64-1.24.2/lib"
+          Add-Content $env:GITHUB_ENV 'ORT_PREFER_DYNAMIC_LINK=1'
+      - name: Compile and lint all Windows application targets
+        working-directory: src-tauri
+        run: cargo clippy --locked --all-targets

@@ -535,6 +535,10 @@
         "label": "השתק בזמן הקלטה",
         "description": "השתק את שמע המערכת בזמן הקלטה"
       },
+      "pauseMediaWhileRecording": {
+        "label": "Pause Media While Recording",
+        "description": "Pause currently playing media during recording and resume it afterwards"
+      },
       "appendTrailingSpace": {
         "label": "הוסף רווח בסוף",
         "description": "הוסף רווח אחרי התמלול המודבק"

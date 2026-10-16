@@ -279,3 +279,28 @@ bun run tauri dev
 # Or compile a release binary without the installer/signing step:
 bun run tauri build --no-bundle
 ```
+
+### Fork CI packages and signed releases
+
+Fork main builds and manual test builds explicitly select `artifact-only` mode.
+They retain Actions artifacts named `unsigned-test-*` for isolated testing;
+these are unsigned test packages, not trusted releases. A temporary runner-only
+Tauri configuration disables updater artifact generation and the upstream Windows
+signing command. The tracked updater public key, endpoint, and production signing
+configuration remain unchanged. These workflows do not publish a GitHub release
+or install anything on contributors' computers.
+
+`Fork artifact packaging` checks the build policy and packages MSI/NSIS installers
+on a standard GitHub-hosted Windows VM. It verifies that both installers are
+unsigned and no updater signatures were generated, then runs the existing package
+contents audit in that VM. This PR check does not upload or retain the installers;
+it avoids adding artifact storage usage. Main and manual builds retain their
+existing artifact retention behavior. This does not validate packaging for every
+other target.
+
+The manual `Release` workflow still requires signing. The reusable workflow rejects
+any `release-id` combined with unsigned or artifact-only mode before building;
+it never falls back to unsigned release assets when credentials are unavailable.
+A fork needs its own deliberately configured signing credentials and release trust
+configuration before publishing signed releases. No credentials are generated or
+replaced by the test-artifact mode.

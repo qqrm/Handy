@@ -1,3 +1,4 @@
+use super::media_pause::MediaPauseController;
 use crate::audio_toolkit::{
     list_input_devices,
     vad::{
@@ -230,6 +231,8 @@ fn restore_mute(prev_muted: Option<bool>) {
     }
 }
 
+/* ──────────────────────────────────────────────────────────────── */
+
 const WHISPER_SAMPLE_RATE: usize = 16000;
 
 /* ──────────────────────────────────────────────────────────────── */
@@ -382,6 +385,7 @@ pub struct AudioRecordingManager {
     is_open: Arc<Mutex<bool>>,
     is_recording: Arc<Mutex<bool>>,
     mute_state: Arc<Mutex<MuteState>>,
+    media_pause: MediaPauseController,
     close_generation: Arc<AtomicU64>,
     cancel_generation: Arc<AtomicU64>,
     stream_router: Arc<StreamRouter>,
@@ -427,6 +431,7 @@ impl AudioRecordingManager {
             is_open: Arc::new(Mutex::new(false)),
             is_recording: Arc::new(Mutex::new(false)),
             mute_state: Arc::new(Mutex::new(MuteState::default())),
+            media_pause: MediaPauseController::new(),
             close_generation: Arc::new(AtomicU64::new(0)),
             cancel_generation: Arc::new(AtomicU64::new(0)),
             stream_router,
@@ -620,6 +625,30 @@ impl AudioRecordingManager {
         }
     }
 
+    /// Pauses currently-playing media sessions if pause_media_while_recording
+    /// is enabled and the stream is open. Records which sessions were paused
+    /// so `remove_media_pause` resumes only those.
+    pub fn apply_media_pause(&self, generation: u64) {
+        let settings = get_settings(&self.app_handle);
+        // Drop the stream guard before queueing platform work; the worker
+        // never acquires audio-manager locks.
+        let stream_open = *self.is_open.lock().unwrap();
+        self.media_pause.apply(
+            generation,
+            settings.pause_media_while_recording,
+            stream_open,
+        );
+    }
+
+    /// Resumes the media sessions paused by `apply_media_pause`, if any.
+    pub fn remove_media_pause(&self) {
+        self.media_pause.remove();
+    }
+
+    pub fn restore_media_before_exit(&self) {
+        self.media_pause.restore_before_exit();
+    }
+
     pub fn preload_vad(&self) -> Result<(), anyhow::Error> {
         let mut recorder_opt = self.recorder.lock().unwrap();
         if recorder_opt.is_none() {
@@ -667,6 +696,8 @@ impl AudioRecordingManager {
                     mute_guard.did_mute = false;
                 }
             }
+            // Queue media restoration without acquiring `is_open` again.
+            self.remove_media_pause();
             if let Some(rec) = self.recorder.lock().unwrap().as_mut() {
                 let _ = rec.close();
             }
@@ -690,6 +721,8 @@ impl AudioRecordingManager {
                 mute_guard.did_mute = false;
             }
         }
+        // Same belt-and-suspenders for paused media: never strand it paused.
+        self.remove_media_pause();
 
         // Get the selected device from settings, considering clamshell mode.
         // No pre-flight enumeration here: when nothing is configured the
@@ -759,6 +792,9 @@ impl AudioRecordingManager {
             }
             mute_guard.did_mute = false;
         }
+        // Mirror the mute restore so paused media is never left stranded when
+        // the stream closes (lazy close, mode switch, device change).
+        self.remove_media_pause();
 
         if let Some(rec) = self.recorder.lock().unwrap().as_mut() {
             // If still recording, stop first.
@@ -846,6 +882,7 @@ impl AudioRecordingManager {
                                 binding_id: binding_id.to_string(),
                             },
                         );
+                        self.media_pause.begin(generation);
                         debug!("Recording requested for binding {binding_id}");
                         return Ok(RecordingReadiness {
                             receiver,
@@ -966,6 +1003,7 @@ impl AudioRecordingManager {
     /// Called at the beginning of stop, before the slower capture drain starts.
     pub fn invalidate_recording_readiness(&self) {
         self.capture_generation.fetch_add(1, Ordering::AcqRel);
+        self.media_pause.remove();
     }
 
     pub fn is_recording_readiness_current(&self, generation: u64) -> bool {

@@ -549,6 +549,10 @@
         "label": "Dempen tijdens opname",
         "description": "Systeemgeluid dempen tijdens het opnemen"
       },
+      "pauseMediaWhileRecording": {
+        "label": "Pause Media While Recording",
+        "description": "Pause currently playing media during recording and resume it afterwards"
+      },
       "appendTrailingSpace": {
         "label": "Spatie achteraan toevoegen",
         "description": "Voeg een spatie toe na de geplakte transcriptie"

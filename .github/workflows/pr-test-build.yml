@@ -43,7 +43,8 @@ jobs:
       platform: ${{ matrix.platform }}
       target: ${{ matrix.target }}
       build-args: ${{ matrix.args }}
-      sign-binaries: true
+      sign-binaries: ${{ github.repository == 'cjpais/Handy' }}
+      artifact-only: ${{ github.repository != 'cjpais/Handy' }}
       asset-prefix: "handy-pr-${{ inputs.pr_number }}"
       upload-artifacts: true
       is-debug-build: ${{ contains(matrix.args, '--debug') }}
