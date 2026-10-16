@@ -2,21 +2,14 @@ import { appendFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export function planBuild({
-  artifactOnly,
-  signBinaries,
-  releaseId,
-  uploadArtifacts,
-}) {
+export function planBuild({ artifactOnly, signBinaries, releaseId }) {
   if (releaseId && (artifactOnly || !signBinaries)) {
     throw new Error(
       "Release assets require signing; artifact-only releases are forbidden",
     );
   }
-  if (artifactOnly && (signBinaries || !uploadArtifacts)) {
-    throw new Error(
-      "Artifact-only mode requires unsigned, retained CI artifacts",
-    );
+  if (artifactOnly && signBinaries) {
+    throw new Error("Artifact-only mode requires unsigned CI artifacts");
   }
   if (!signBinaries && !artifactOnly) {
     throw new Error("Unsigned builds require explicit artifact-only mode");
@@ -46,7 +39,6 @@ export function prepareBuild(env) {
     artifactOnly: booleanInput(env, "HANDY_ARTIFACT_ONLY"),
     signBinaries: booleanInput(env, "HANDY_SIGN_BINARIES"),
     releaseId: env.HANDY_RELEASE_ID ?? "",
-    uploadArtifacts: booleanInput(env, "HANDY_UPLOAD_ARTIFACTS"),
   });
   if (!env.GITHUB_OUTPUT || !env.RUNNER_TEMP) {
     throw new Error(

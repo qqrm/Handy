@@ -293,7 +293,10 @@ or install anything on contributors' computers.
 `Fork artifact packaging` checks the build policy and packages MSI/NSIS installers
 on a standard GitHub-hosted Windows VM. It verifies that both installers are
 unsigned and no updater signatures were generated, then runs the existing package
-contents audit in that VM. This does not validate packaging for every other target.
+contents audit in that VM. This PR check does not upload or retain the installers;
+it avoids adding artifact storage usage. Main and manual builds retain their
+existing artifact retention behavior. This does not validate packaging for every
+other target.
 
 The manual `Release` workflow still requires signing. The reusable workflow rejects
 any `release-id` combined with unsigned or artifact-only mode before building;

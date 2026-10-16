@@ -28,13 +28,26 @@ test("release combinations reject unsigned or artifact-only publication", () => 
   }
 });
 
-test("unsigned builds require artifact intent and retained files", () => {
+test("unsigned builds require explicit artifact intent", () => {
   for (const inputs of [
     { artifactOnly: false, signBinaries: false, uploadArtifacts: true },
     { artifactOnly: true, signBinaries: true, uploadArtifacts: true },
-    { artifactOnly: true, signBinaries: false, uploadArtifacts: false },
   ]) {
     assert.throws(() => planBuild({ ...inputs, releaseId: "" }));
+  }
+});
+
+test("artifact-only checks can avoid retained installer storage", () => {
+  for (const uploadArtifacts of [false, true]) {
+    assert.equal(
+      planBuild({
+        artifactOnly: true,
+        signBinaries: false,
+        releaseId: "",
+        uploadArtifacts,
+      }).label,
+      "unsigned-test-",
+    );
   }
 });
 
@@ -125,11 +138,7 @@ test("signed release creates no artifact overlay or unsigned label", () => {
 });
 
 test("ambiguous boolean inputs fail closed", () => {
-  for (const name of [
-    "HANDY_ARTIFACT_ONLY",
-    "HANDY_SIGN_BINARIES",
-    "HANDY_UPLOAD_ARTIFACTS",
-  ]) {
+  for (const name of ["HANDY_ARTIFACT_ONLY", "HANDY_SIGN_BINARIES"]) {
     const env = {
       HANDY_ARTIFACT_ONLY: "true",
       HANDY_SIGN_BINARIES: "false",

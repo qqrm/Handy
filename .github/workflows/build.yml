@@ -89,7 +89,6 @@ jobs:
         env:
           HANDY_ARTIFACT_ONLY: ${{ inputs.artifact-only }}
           HANDY_SIGN_BINARIES: ${{ inputs.sign-binaries }}
-          HANDY_UPLOAD_ARTIFACTS: ${{ inputs.upload-artifacts }}
           HANDY_RELEASE_ID: ${{ inputs.release-id }}
         run: node scripts/ci/build-policy.mjs
 
