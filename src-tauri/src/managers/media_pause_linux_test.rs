@@ -22,8 +22,7 @@ fn require_isolated_mpris_test_environment() {
         );
     }
     assert!(
-        std::env::var("DBUS_SESSION_BUS_ADDRESS")
-            .is_ok_and(|address| address.starts_with("unix:")),
+        std::env::var("DBUS_SESSION_BUS_ADDRESS").is_ok_and(|address| address.starts_with("unix:")),
         "Run the hosted fixture under dbus-run-session with a private Unix bus"
     );
 }
@@ -35,7 +34,10 @@ struct Fixture {
 
 impl Fixture {
     fn spawn(label: &str) -> Self {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let directory = std::env::temp_dir().join(format!(
             "handy-mpris-{}-{label}-{nonce}",
             std::process::id()
@@ -89,7 +91,9 @@ impl Fixture {
                 if pid == Ok(self.child.id()) {
                     eprintln!(
                         "Fixture PID={} service={} owner={}",
-                        self.child.id(), session.service, session.owner
+                        self.child.id(),
+                        session.service,
+                        session.owner
                     );
                     return session;
                 }
@@ -113,7 +117,10 @@ impl Drop for Fixture {
         let _ = self.child.wait();
         if let Ok(log) = std::fs::read_to_string(self.directory.join("vlc.log")) {
             let tail: String = log.chars().rev().take(4000).collect();
-            eprintln!("VLC diagnostic tail: {}", tail.chars().rev().collect::<String>());
+            eprintln!(
+                "VLC diagnostic tail: {}",
+                tail.chars().rev().collect::<String>()
+            );
         }
         let _ = std::fs::remove_dir_all(&self.directory);
     }
@@ -142,9 +149,29 @@ fn write_wav(path: &std::path::Path) {
 
 struct OnlyFixtures(Vec<Arc<Session>>);
 
+struct CurrentFixtures(Mutex<Vec<Arc<Session>>>);
+
+impl MediaBackend for CurrentFixtures {
+    fn sessions(&self) -> MediaResult<Vec<Arc<dyn MediaSession>>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(|session| session as Arc<dyn MediaSession>)
+            .collect())
+    }
+}
+
 impl MediaBackend for OnlyFixtures {
     fn sessions(&self) -> MediaResult<Vec<Arc<dyn MediaSession>>> {
-        Ok(self.0.iter().cloned().map(|session| session as Arc<dyn MediaSession>).collect())
+        Ok(self
+            .0
+            .iter()
+            .cloned()
+            .map(|session| session as Arc<dyn MediaSession>)
+            .collect())
     }
 }
 
@@ -155,7 +182,10 @@ fn wait_state(session: &Session, expected: PlaybackState, stage: &str) {
         if actual == Ok(expected) {
             return;
         }
-        assert!(Instant::now() < deadline, "{stage}: expected {expected:?}, got {actual:?}");
+        assert!(
+            Instant::now() < deadline,
+            "{stage}: expected {expected:?}, got {actual:?}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -167,15 +197,25 @@ fn complete(mut operation: MediaOperation) {
             assert_eq!(result, Ok(true));
             return;
         }
-        assert!(Instant::now() < deadline, "MPRIS operation did not acknowledge");
+        assert!(
+            Instant::now() < deadline,
+            "MPRIS operation did not acknowledge"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
 fn position(session: &Session) -> i64 {
     bounded(READ_TIMEOUT, async {
-        session.proxy().await.map_err(error)?.get_property::<i64>("Position").await.map_err(error)
-    }).expect("Read actual VLC position")
+        session
+            .proxy()
+            .await
+            .map_err(error)?
+            .get_property::<i64>("Position")
+            .await
+            .map_err(error)
+    })
+    .expect("Read actual VLC position")
 }
 
 fn require_progress(session: &Session, stage: &str) {
@@ -188,7 +228,10 @@ fn require_progress(session: &Session, stage: &str) {
             eprintln!("Real VLC progress at {stage}: position_us={before}->{after}");
             return;
         }
-        assert!(Instant::now() < deadline, "VLC clock did not progress at {stage}");
+        assert!(
+            Instant::now() < deadline,
+            "VLC clock did not progress at {stage}"
+        );
         std::thread::sleep(Duration::from_millis(25));
     }
 }
@@ -200,7 +243,10 @@ fn require_paused_clock(session: &Session, stage: &str) {
     let before = position(session);
     std::thread::sleep(Duration::from_millis(300));
     let after = position(session);
-    assert!((after - before).abs() <= 10_000, "VLC clock moved while paused at {stage}: {before}->{after}");
+    assert!(
+        (after - before).abs() <= 10_000,
+        "VLC clock moved while paused at {stage}: {before}->{after}"
+    );
     eprintln!("Real VLC paused at {stage}: position_us={before}->{after}");
 }
 
@@ -213,7 +259,10 @@ fn start(controller: &MediaPauseController, generation: u64) {
 #[ignore = "Restricted to the isolated GitHub-hosted Linux MPRIS job"]
 fn isolated_linux_vlc_pause_resume_override_and_replacement() {
     require_isolated_mpris_test_environment();
-    assert!(enumerate().unwrap().is_empty(), "The private fixture bus must start without players");
+    assert!(
+        enumerate().unwrap().is_empty(),
+        "The private fixture bus must start without players"
+    );
     let mut first = Fixture::spawn("first");
     let a = first.session();
     assert_eq!(a.service, "org.mpris.MediaPlayer2.vlc");
@@ -224,7 +273,8 @@ fn isolated_linux_vlc_pause_resume_override_and_replacement() {
     complete(b.pause().unwrap());
     require_paused_clock(&b, "initially paused player");
 
-    let controller = MediaPauseController::with_backend(Arc::new(OnlyFixtures(vec![a.clone(), b.clone()])));
+    let controller =
+        MediaPauseController::with_backend(Arc::new(OnlyFixtures(vec![a.clone(), b.clone()])));
     start(&controller, 1);
     require_paused_clock(&a, "recording");
     controller.remove();
@@ -260,7 +310,10 @@ fn isolated_linux_vlc_pause_resume_override_and_replacement() {
     let mut replacement = Fixture::spawn("replacement");
     let c = replacement.session();
     assert_eq!(a.service, c.service, "Exercise well-known-name reuse");
-    assert_ne!(a.owner, c.owner, "Replacement must have a different D-Bus connection");
+    assert_ne!(
+        a.owner, c.owner,
+        "Replacement must have a different D-Bus connection"
+    );
     assert_eq!(a.is_live(), Ok(false));
     complete(c.pause().unwrap());
     require_paused_clock(&c, "replacement manually paused");
@@ -303,13 +356,19 @@ impl ProtocolPlayer {
     }
 
     #[zbus(property)]
-    fn can_control(&self) -> bool { true }
+    fn can_control(&self) -> bool {
+        true
+    }
 
     #[zbus(property)]
-    fn can_pause(&self) -> bool { true }
+    fn can_pause(&self) -> bool {
+        true
+    }
 
     #[zbus(property)]
-    fn can_play(&self) -> bool { true }
+    fn can_play(&self) -> bool {
+        true
+    }
 
     async fn pause(
         &self,
@@ -319,7 +378,8 @@ impl ProtocolPlayer {
         let gate = self.0.pause_gate.lock().unwrap().take();
         let _ = self.0.pause_started.send(());
         if let Some(gate) = gate {
-            gate.await.map_err(|_| zbus::fdo::Error::Failed("Fixture gate dropped".into()))?;
+            gate.await
+                .map_err(|_| zbus::fdo::Error::Failed("Fixture gate dropped".into()))?;
         }
         self.0.status.store(1, Ordering::SeqCst);
         self.playback_status_changed(&emitter).await?;
@@ -339,16 +399,28 @@ impl ProtocolPlayer {
 
 fn emit_status(connection: &Connection, state: &ProtocolState, value: u64) {
     state.status.store(value, Ordering::SeqCst);
-    let value = match value { 0 => "Playing", 1 => "Paused", _ => "Stopped" };
+    let value = match value {
+        0 => "Playing",
+        1 => "Paused",
+        _ => "Stopped",
+    };
     bounded(READ_TIMEOUT, async {
-        connection.emit_signal(
-            None::<&str>,
-            PATH,
-            PROPERTIES,
-            "PropertiesChanged",
-            &(PLAYER, HashMap::from([("PlaybackStatus", zbus::zvariant::Value::from(value))]), Vec::<String>::new()),
-        ).await.map_err(error)
-    }).unwrap();
+        connection
+            .emit_signal(
+                None::<&str>,
+                PATH,
+                PROPERTIES,
+                "PropertiesChanged",
+                &(
+                    PLAYER,
+                    HashMap::from([("PlaybackStatus", zbus::zvariant::Value::from(value))]),
+                    Vec::<String>::new(),
+                ),
+            )
+            .await
+            .map_err(error)
+    })
+    .unwrap();
 }
 
 #[test]
@@ -366,15 +438,28 @@ fn isolated_linux_dbus_delayed_ack_and_signal_ownership() {
     });
     let service = "org.mpris.MediaPlayer2.HandyProtocolFixture";
     let connection = bounded(SETUP_TIMEOUT, async {
-        zbus::connection::Builder::session().map_err(error)?
-            .name(service).map_err(error)?
-            .serve_at(PATH, ProtocolPlayer(state.clone())).map_err(error)?
-            .build().await.map_err(error)
-    }).unwrap();
-    let session = enumerate().unwrap().into_iter().find(|session| session.service == service).unwrap();
-    let controller = MediaPauseController::with_backend(Arc::new(OnlyFixtures(vec![session.clone()])));
+        zbus::connection::Builder::session()
+            .map_err(error)?
+            .name(service)
+            .map_err(error)?
+            .serve_at(PATH, ProtocolPlayer(state.clone()))
+            .map_err(error)?
+            .build()
+            .await
+            .map_err(error)
+    })
+    .unwrap();
+    let session = enumerate()
+        .unwrap()
+        .into_iter()
+        .find(|session| session.service == service)
+        .unwrap();
+    let controller =
+        MediaPauseController::with_backend(Arc::new(OnlyFixtures(vec![session.clone()])));
     start(&controller, 101);
-    started.recv_timeout(Duration::from_secs(3)).expect("Pause reached the service");
+    started
+        .recv_timeout(Duration::from_secs(3))
+        .expect("Pause reached the service");
     controller.remove();
     // Exceed the read deadline while the dispatched Pause has no reply. The
     // lease must survive End; a later Paused transition must still be restored.
@@ -384,10 +469,17 @@ fn isolated_linux_dbus_delayed_ack_and_signal_ownership() {
     release.send(()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while state.play_calls.load(Ordering::SeqCst) == 0 {
-        assert!(Instant::now() < deadline, "Late Pause was not restored after End");
+        assert!(
+            Instant::now() < deadline,
+            "Late Pause was not restored after End"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
-    wait_state(&session, PlaybackState::Playing, "late acknowledgement restoration");
+    wait_state(
+        &session,
+        PlaybackState::Playing,
+        "late acknowledgement restoration",
+    );
     assert_eq!(state.pause_calls.load(Ordering::SeqCst), 1);
     assert_eq!(state.play_calls.load(Ordering::SeqCst), 1);
     controller.restore_before_exit();
@@ -402,23 +494,116 @@ fn isolated_linux_dbus_delayed_ack_and_signal_ownership() {
     emit_status(&connection, &state, 0);
     emit_status(&connection, &state, 1);
     assert_eq!(session.state(), Ok(PlaybackState::Paused));
-    assert!(!ownership.can_resume(), "Queued user Play -> Pause lost by observer");
+    assert!(
+        !ownership.can_resume(),
+        "Queued user Play -> Pause lost by observer"
+    );
     drop(watch);
 
-    let old_owner = session.owner.clone();
-    bounded(SETUP_TIMEOUT, async { connection.close().await.map_err(error) }).unwrap();
+    // Release the public name while the ORIGINAL connection is still executing
+    // a delayed Pause. Losing the name must not release that unresolved lease.
+    let (release, gate) = oneshot::channel();
+    *state.pause_gate.lock().unwrap() = Some(gate);
+    emit_status(&connection, &state, 0);
+    let backend = Arc::new(CurrentFixtures(Mutex::new(vec![session.clone()])));
+    let controller = MediaPauseController::with_backend(backend.clone());
+    start(&controller, 201);
+    started
+        .recv_timeout(Duration::from_secs(3))
+        .expect("Second delayed Pause reached original owner");
+    assert!(bounded(SETUP_TIMEOUT, async {
+        connection.release_name(service).await.map_err(error)
+    })
+    .unwrap());
+    let (replacement_started, _) = mpsc::channel();
+    let replacement_state = Arc::new(ProtocolState {
+        status: AtomicU64::new(0),
+        pause_started: replacement_started,
+        pause_gate: Mutex::new(None),
+        pause_calls: AtomicU64::new(0),
+        play_calls: AtomicU64::new(0),
+    });
     let replacement = bounded(SETUP_TIMEOUT, async {
-        zbus::connection::Builder::session().map_err(error)?
-            .name(service).map_err(error)?
-            .serve_at(PATH, ProtocolPlayer(state.clone())).map_err(error)?
-            .build().await.map_err(error)
-    }).unwrap();
-    let replacement_session = enumerate().unwrap().into_iter().find(|session| session.service == service).unwrap();
-    assert_ne!(old_owner, replacement_session.owner);
-    assert_eq!(session.is_live(), Ok(false));
-    let mut rejected = session.play().unwrap();
-    assert_eq!(rejected(), Some(Ok(false)), "Old owner must never target replacement");
-    assert_eq!(replacement_session.state(), Ok(PlaybackState::Paused));
+        zbus::connection::Builder::session()
+            .map_err(error)?
+            .name(service)
+            .map_err(error)?
+            .serve_at(PATH, ProtocolPlayer(replacement_state.clone()))
+            .map_err(error)?
+            .build()
+            .await
+            .map_err(error)
+    })
+    .unwrap();
+    let replacement_session = enumerate()
+        .unwrap()
+        .into_iter()
+        .find(|session| session.service == service)
+        .unwrap();
+    assert_ne!(session.owner, replacement_session.owner);
+    assert_eq!(
+        session.is_live(),
+        Ok(true),
+        "Public name loss is not connection disappearance"
+    );
+    assert_eq!(session.owns_service_name(), Ok(false));
+    for mut rejected in [session.pause().unwrap(), session.play().unwrap()] {
+        assert_eq!(
+            rejected(),
+            Some(Ok(false)),
+            "Released name forbids new commands to old owner"
+        );
+    }
+    *backend.0.lock().unwrap() = vec![replacement_session.clone()];
+    controller.remove();
+    start(&controller, 202);
+    std::thread::sleep(Duration::from_millis(1250));
+    controller.flush();
+    assert_eq!(state.pause_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        state.play_calls.load(Ordering::SeqCst),
+        1,
+        "No stale Play while old Pause is unresolved"
+    );
+    assert_eq!(
+        replacement_state.pause_calls.load(Ordering::SeqCst),
+        0,
+        "No overlapping Pause on replacement while original request is unresolved"
+    );
+    assert_eq!(replacement_state.play_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(session.is_live(), Ok(true));
+    // Cancel the new recording before releasing the old request, so no command
+    // from either old generation may later affect the replacement.
+    controller.remove();
+    controller.flush();
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.status.load(Ordering::SeqCst) != 1 {
+        assert!(
+            Instant::now() < deadline,
+            "Original owner did not execute delayed Pause"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    controller.restore_before_exit();
+    drop(controller);
+    assert_eq!(state.pause_calls.load(Ordering::SeqCst), 2);
     assert_eq!(state.play_calls.load(Ordering::SeqCst), 1);
-    bounded(SETUP_TIMEOUT, async { replacement.close().await.map_err(error) }).unwrap();
+    assert_eq!(replacement_state.pause_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(replacement_state.play_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(replacement_session.state(), Ok(PlaybackState::Playing));
+    assert_eq!(session.is_live(), Ok(true));
+    bounded(SETUP_TIMEOUT, async {
+        connection.close().await.map_err(error)
+    })
+    .unwrap();
+    assert_eq!(
+        session.is_live(),
+        Ok(false),
+        "Only unique connection disappearance ends liveness"
+    );
+    bounded(SETUP_TIMEOUT, async {
+        replacement.close().await.map_err(error)
+    })
+    .unwrap();
 }

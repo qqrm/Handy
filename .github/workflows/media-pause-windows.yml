@@ -45,7 +45,10 @@ jobs:
           manifest=src-tauri/tests/media-pause/Cargo.toml
           if ! cargo metadata --locked --format-version 1 --manifest-path "$manifest" >/dev/null; then
             # Produce review data only; never continue tests with an uncommitted lock.
-            cargo generate-lockfile --manifest-path "$manifest"
+            # Seed with the application graph: isolated tests should exercise
+            # the same resolved libraries, not silently upgrade transitive code.
+            cp src-tauri/Cargo.lock src-tauri/tests/media-pause/Cargo.lock
+            cargo metadata --format-version 1 --manifest-path "$manifest" >/dev/null
             python3 - <<'PY'
           import base64
           from pathlib import Path

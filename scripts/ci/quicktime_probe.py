@@ -40,7 +40,7 @@ static NSString *receipt;
 static BOOL ownsPlayer = NO;
 static NSInteger playbackCommands = 0;
 
-static void require(BOOL ok, NSString *why) {
+static void probeRequire(BOOL ok, NSString *why) {
     if (!ok) @throw [NSException exceptionWithName:@"ProbeFailure" reason:why userInfo:nil];
 }
 static void save(void) {
@@ -48,18 +48,18 @@ static void save(void) {
     NSError *error = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:report
         options:NSJSONWritingPrettyPrinted error:&error];
-    require(data != nil, [NSString stringWithFormat:@"JSON receipt: %@", error]);
-    require([data writeToFile:receipt options:NSDataWritingAtomic error:&error],
+    probeRequire(data != nil, [NSString stringWithFormat:@"JSON receipt: %@", error]);
+    probeRequire([data writeToFile:receipt options:NSDataWritingAtomic error:&error],
         [NSString stringWithFormat:@"Receipt write: %@", error]);
 }
-static void check(NSString *name, NSDictionary *facts) {
+static void recordCheck(NSString *name, NSDictionary *facts) {
     [checks addObject:@{@"name": name, @"status": @"passed", @"facts": facts}];
     save();
 }
 static OSType code(NSString *key) { return (OSType)[cfg[@"codes"][key] unsignedIntValue]; }
 static void live(void) {
     NSRunningApplication *now = [NSRunningApplication runningApplicationWithProcessIdentifier:player.processIdentifier];
-    require(!player.terminated && now && !now.terminated &&
+    probeRequire(!player.terminated && now && !now.terminated &&
         [now.bundleIdentifier isEqualToString:@"com.apple.QuickTimePlayerX"] &&
         started && [now.launchDate isEqualToDate:started], @"QuickTime process generation changed");
 }
@@ -71,10 +71,10 @@ static NSAppleEventDescriptor *spec(OSType kind, NSAppleEventDescriptor *contain
     [record setDescriptor:[NSAppleEventDescriptor descriptorWithEnumCode:form] forKeyword:keyAEKeyForm];
     [record setDescriptor:key forKeyword:keyAEKeyData];
     NSAppleEventDescriptor *out = [record coerceToDescriptorType:typeObjectSpecifier];
-    require(out != nil, @"Could not construct Apple Event object specifier");
+    probeRequire(out != nil, @"Could not construct Apple Event object specifier");
     return out;
 }
-static NSAppleEventDescriptor *send(OSType eventClass, OSType eventID,
+static NSAppleEventDescriptor *sendAppleEvent(OSType eventClass, OSType eventID,
                                     NSAppleEventDescriptor *object, BOOL wantsValue) {
     live();
     NSAppleEventDescriptor *event = [NSAppleEventDescriptor appleEventWithEventClass:eventClass
@@ -85,18 +85,18 @@ static NSAppleEventDescriptor *send(OSType eventClass, OSType eventID,
     NSAppleEventSendOptions mode = NSAppleEventSendWaitForReply | NSAppleEventSendNeverInteract |
         (NSAppleEventSendOptions)kAEDoNotPromptForUserConsent;
     NSAppleEventDescriptor *reply = [event sendEventWithOptions:mode timeout:4.0 error:&error];
-    require(reply != nil, [NSString stringWithFormat:@"Apple Event transport failed: %@", error]);
+    probeRequire(reply != nil, [NSString stringWithFormat:@"Apple Event transport failed: %@", error]);
     NSAppleEventDescriptor *number = [reply paramDescriptorForKeyword:keyErrorNumber];
-    require(!number || number.int32Value == 0, [NSString stringWithFormat:
+    probeRequire(!number || number.int32Value == 0, [NSString stringWithFormat:
         @"Apple Event error %d: %@", number.int32Value,
         [reply paramDescriptorForKeyword:keyErrorString].stringValue]);
     NSAppleEventDescriptor *value = [reply paramDescriptorForKeyword:keyDirectObject];
-    require(!wantsValue || value != nil, @"Apple Event omitted required result");
+    probeRequire(!wantsValue || value != nil, @"Apple Event omitted required result");
     live();
     return value;
 }
 static NSAppleEventDescriptor *get(NSAppleEventDescriptor *object) {
-    return send(kAECoreSuite, kAEGetData, object, YES);
+    return sendAppleEvent(kAECoreSuite, kAEGetData, object, YES);
 }
 static NSAppleEventDescriptor *property(NSAppleEventDescriptor *doc, OSType propertyCode) {
     return get(spec(cProperty, doc, formPropertyID,
@@ -107,53 +107,72 @@ static NSAppleEventDescriptor *documents(void) {
     NSAppleEventDescriptor *list = get(spec(code(@"document"), nil, formAbsolutePosition,
         [NSAppleEventDescriptor descriptorWithDescriptorType:typeAbsoluteOrdinal
             bytes:&ordinal length:sizeof(ordinal)]));
-    require(list.descriptorType == typeAEList, @"Documents reply is not a list");
+    probeRequire(list.descriptorType == typeAEList, @"Documents reply is not a list");
     return list;
 }
+static NSAppleEventDescriptor *documentIdentity(NSAppleEventDescriptor *doc) {
+    // Cocoa may return an ID-based reference without declaring an `id`
+    // property in the app's scripting dictionary. Inspect the actual reference;
+    // never treat an index or display name as a durable document identity.
+    NSAppleEventDescriptor *resolved = get(doc);
+    report[@"last_document_reference"] = resolved.description ?: @"(no descriptor description)";
+    probeRequire(resolved.descriptorType == typeObjectSpecifier,
+        @"QuickTime did not return a document object specifier");
+    NSAppleEventDescriptor *record = [resolved coerceToDescriptorType:typeAERecord];
+    NSAppleEventDescriptor *kind = [record descriptorForKeyword:keyAEDesiredClass];
+    NSAppleEventDescriptor *form = [record descriptorForKeyword:keyAEKeyForm];
+    NSAppleEventDescriptor *container = [record descriptorForKeyword:keyAEContainer];
+    NSAppleEventDescriptor *identity = [record descriptorForKeyword:keyAEKeyData];
+    probeRequire(record && kind.descriptorType == typeType && kind.typeCodeValue == code(@"document") &&
+        form.descriptorType == typeEnumerated && form.enumCodeValue == formUniqueID &&
+        container && container.descriptorType == typeNull && identity &&
+        identity.descriptorType != typeNull && identity.data.length > 0,
+        @"QuickTime reference lacks a stable formUniqueID document identity; no name/index fallback");
+    return identity;
+}
 static NSAppleEventDescriptor *freeze(NSAppleEventDescriptor *doc) {
-    NSAppleEventDescriptor *identity = property(doc, code(@"id"));
-    require(identity.descriptorType != typeNull && identity.data.length > 0, @"Empty document identity");
+    NSAppleEventDescriptor *identity = documentIdentity(doc);
     NSAppleEventDescriptor *frozen = spec(code(@"document"), nil, formUniqueID, identity);
-    NSAppleEventDescriptor *roundtrip = property(frozen, code(@"id"));
-    require(identity.descriptorType == roundtrip.descriptorType && [identity.data isEqual:roundtrip.data],
+    NSAppleEventDescriptor *roundtrip = documentIdentity(frozen);
+    probeRequire(identity.descriptorType == roundtrip.descriptorType && [identity.data isEqual:roundtrip.data],
         @"Document ID did not roundtrip through formUniqueID");
     return frozen;
 }
 static NSString *identity(NSAppleEventDescriptor *doc) {
-    NSAppleEventDescriptor *value = property(doc, code(@"id"));
+    NSAppleEventDescriptor *value = documentIdentity(doc);
     return [NSString stringWithFormat:@"%08x:%@", (unsigned)value.descriptorType,
         [value.data base64EncodedStringWithOptions:0]];
 }
 static BOOL playing(NSAppleEventDescriptor *doc) {
     NSAppleEventDescriptor *value = [property(doc, code(@"playing")) coerceToDescriptorType:typeBoolean];
-    require(value != nil, @"Playing property is not boolean");
+    probeRequire(value != nil, @"Playing property is not boolean");
     return value.booleanValue;
 }
 static double position(NSAppleEventDescriptor *doc) {
     NSAppleEventDescriptor *value = [property(doc, code(@"current_time"))
         coerceToDescriptorType:typeIEEE64BitFloatingPoint];
-    require(value != nil && isfinite(value.doubleValue), @"Current time is not finite numeric data");
+    probeRequire(value != nil && isfinite(value.doubleValue), @"Current time is not finite numeric data");
     return value.doubleValue;
 }
 static void command(NSString *name, NSAppleEventDescriptor *doc) {
     playbackCommands += 1;
-    send(code([name stringByAppendingString:@"_class"]), code([name stringByAppendingString:@"_id"]), doc, NO);
+    sendAppleEvent(code([name stringByAppendingString:@"_class"]), code([name stringByAppendingString:@"_id"]), doc, NO);
 }
 static void waitState(NSAppleEventDescriptor *doc, BOOL expected) {
     for (int i = 0; i < 30; ++i) {
         if (playing(doc) == expected) return;
         [NSThread sleepForTimeInterval:0.1];
     }
-    require(NO, @"Player did not acknowledge requested playback state");
+    probeRequire(NO, @"Player did not acknowledge requested playback state");
 }
 static double assertAdvancing(NSAppleEventDescriptor *doc, NSString *name) {
     waitState(doc, YES);
     double before = position(doc);
     [NSThread sleepForTimeInterval:1.25];
     double after = position(doc);
-    require(playing(doc) && after - before >= 0.35 && after - before < 5.0,
+    probeRequire(playing(doc) && after - before >= 0.35 && after - before < 5.0,
         [NSString stringWithFormat:@"%@: playback did not advance plausibly (%f -> %f)", name, before, after]);
-    check(name, @{@"before_seconds": @(before), @"after_seconds": @(after)});
+    recordCheck(name, @{@"before_seconds": @(before), @"after_seconds": @(after)});
     return after;
 }
 static double assertPaused(NSAppleEventDescriptor *doc, NSString *name) {
@@ -162,25 +181,25 @@ static double assertPaused(NSAppleEventDescriptor *doc, NSString *name) {
     double before = position(doc);
     [NSThread sleepForTimeInterval:0.8];
     double after = position(doc);
-    require(!playing(doc) && fabs(after - before) < 0.10,
+    probeRequire(!playing(doc) && fabs(after - before) < 0.10,
         [NSString stringWithFormat:@"%@: paused position moved (%f -> %f)", name, before, after]);
-    check(name, @{@"before_seconds": @(before), @"after_seconds": @(after)});
+    recordCheck(name, @{@"before_seconds": @(before), @"after_seconds": @(after)});
     return after;
 }
 static NSAppleEventDescriptor *openFile(NSString *path, NSInteger expectedCount) {
     NSAppleEventDescriptor *files = [NSAppleEventDescriptor listDescriptor];
     [files insertDescriptor:[NSAppleEventDescriptor descriptorWithFileURL:[NSURL fileURLWithPath:path]] atIndex:1];
-    send(kCoreEventClass, kAEOpenDocuments, files, NO);
+    sendAppleEvent(kCoreEventClass, kAEOpenDocuments, files, NO);
     for (int i = 0; i < 30; ++i) {
         NSAppleEventDescriptor *docs = documents();
         if (docs.numberOfItems == expectedCount) return docs;
         [NSThread sleepForTimeInterval:0.1];
     }
-    require(NO, @"Expected document did not open");
+    probeRequire(NO, @"Expected document did not open");
     return nil;
 }
 static void runProbe(void) {
-    require([NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.QuickTimePlayerX"].count == 0,
+    probeRequire([NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.QuickTimePlayerX"].count == 0,
         @"Fresh-VM requirement failed: QuickTime was already running; nothing was altered");
     dispatch_semaphore_t launched = dispatch_semaphore_create(0);
     __block NSError *launchError = nil;
@@ -193,9 +212,9 @@ static void runProbe(void) {
                 player = app; launchError = error; dispatch_semaphore_signal(launched);
             }];
     });
-    require(dispatch_semaphore_wait(launched, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC)) == 0,
+    probeRequire(dispatch_semaphore_wait(launched, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC)) == 0,
         @"QuickTime launch timeout");
-    require(player != nil, [NSString stringWithFormat:@"QuickTime launch failed: %@", launchError]);
+    probeRequire(player != nil, [NSString stringWithFormat:@"QuickTime launch failed: %@", launchError]);
     ownsPlayer = YES;
     started = player.launchDate;
     live();
@@ -210,15 +229,15 @@ static void runProbe(void) {
     OSStatus consent = AEDeterminePermissionToAutomateTarget(target.aeDesc,
         typeWildCard, typeWildCard, true);
     report[@"consent_status"] = @(consent);
-    require(consent == noErr, [NSString stringWithFormat:@"QuickTime TCC consent unavailable: %d", (int)consent]);
-    require(AEDeterminePermissionToAutomateTarget(target.aeDesc,
+    probeRequire(consent == noErr, [NSString stringWithFormat:@"QuickTime TCC consent unavailable: %d", (int)consent]);
+    probeRequire(AEDeterminePermissionToAutomateTarget(target.aeDesc,
         typeWildCard, typeWildCard, false) == noErr, @"Consent not retained");
     report[@"phase"] = @"measuring_real_player";
     save();
 
-    require(documents().numberOfItems == 0, @"Unexpected preexisting QuickTime documents");
-    require(playbackCommands == 0, @"No-media probe unexpectedly sent a playback command");
-    check(@"no_media", @{@"documents": @0, @"play_or_pause_commands_sent": @(playbackCommands)});
+    probeRequire(documents().numberOfItems == 0, @"Unexpected preexisting QuickTime documents");
+    probeRequire(playbackCommands == 0, @"No-media probe unexpectedly sent a playback command");
+    recordCheck(@"no_media", @{@"documents": @0, @"play_or_pause_commands_sent": @(playbackCommands)});
     NSAppleEventDescriptor *a = freeze([openFile(cfg[@"file_a"], 1) descriptorAtIndex:1]);
     NSString *aID = identity(a);
     command(@"play", a);
@@ -231,46 +250,46 @@ static void runProbe(void) {
     for (NSInteger index = 1; index <= both.numberOfItems; ++index) {
         NSAppleEventDescriptor *candidate = freeze([both descriptorAtIndex:index]);
         if (![identity(candidate) isEqualToString:aID]) {
-            require(b == nil, @"More than one unexpected document");
+            probeRequire(b == nil, @"More than one unexpected document");
             b = candidate;
         }
     }
-    require(b != nil, @"Second document did not have distinct identity");
+    probeRequire(b != nil, @"Second document did not have distinct identity");
     NSString *bID = identity(b);
     command(@"pause", b);
     assertPaused(b, @"second_document_paused");
-    require(!playing(a), @"Opening the second document unexpectedly resumed the first");
+    probeRequire(!playing(a), @"Opening the second document unexpectedly resumed the first");
     double bBefore = position(b);
     command(@"play", a); // Frozen formUniqueID, never document 1 or global toggle.
     assertAdvancing(a, @"same_document_resume_advances");
     double bAfter = position(b);
-    require(!playing(b) && fabs(bAfter - bBefore) < 0.10 &&
+    probeRequire(!playing(b) && fabs(bAfter - bBefore) < 0.10 &&
         [identity(a) isEqualToString:aID] && [identity(b) isEqualToString:bID],
         @"Resume affected a different document or document identity changed");
-    check(@"same_document_identity", @{@"resumed_id": aID, @"untouched_id": bID,
+    recordCheck(@"same_document_identity", @{@"resumed_id": aID, @"untouched_id": bID,
         @"other_before_seconds": @(bBefore), @"other_after_seconds": @(bAfter)});
     command(@"pause", a);
     assertPaused(a, @"cleanup_pause");
     // Also exercise a non-first document explicitly: a hard-coded document 1
     // implementation cannot satisfy this assertion and the untouched guard.
     NSAppleEventDescriptor *ordered = documents();
-    require(ordered.numberOfItems == 2, @"Unexpected document count before index-isolation case");
+    probeRequire(ordered.numberOfItems == 2, @"Unexpected document count before index-isolation case");
     NSAppleEventDescriptor *nonFirst = freeze([ordered descriptorAtIndex:2]);
     NSAppleEventDescriptor *first = freeze([ordered descriptorAtIndex:1]);
     NSString *savedID = identity(nonFirst);
-    require(!playing(first) && !playing(nonFirst), @"Index-isolation setup was not paused");
+    probeRequire(!playing(first) && !playing(nonFirst), @"Index-isolation setup was not paused");
     double firstBefore = position(first);
     command(@"play", nonFirst);
     assertAdvancing(nonFirst, @"nonfirst_document_play_advances");
     command(@"pause", nonFirst);
     assertPaused(nonFirst, @"nonfirst_document_pause_stops");
-    require(![identity(freeze([documents() descriptorAtIndex:1])) isEqualToString:savedID],
+    probeRequire(![identity(freeze([documents() descriptorAtIndex:1])) isEqualToString:savedID],
         @"Fixture ordering changed: non-first identity case is not established");
     command(@"play", nonFirst);
     assertAdvancing(nonFirst, @"nonfirst_document_resume_advances");
-    require([identity(nonFirst) isEqualToString:savedID] && !playing(first) &&
+    probeRequire([identity(nonFirst) isEqualToString:savedID] && !playing(first) &&
         fabs(position(first) - firstBefore) < 0.10, @"Resume affected document 1");
-    check(@"nonfirst_document_identity", @{@"resumed_id": savedID, @"untouched_id": identity(first)});
+    recordCheck(@"nonfirst_document_identity", @{@"resumed_id": savedID, @"untouched_id": identity(first)});
     command(@"pause", nonFirst);
     report[@"status"] = @"passed";
     report[@"phase"] = @"complete";
@@ -362,7 +381,16 @@ return "no_exact_dialog"
 
 
 def run(args, *, timeout=30):
-    return subprocess.run(args, check=True, capture_output=True, text=True, timeout=timeout)
+    try:
+        return subprocess.run(args, check=True, capture_output=True, text=True, timeout=timeout)
+    except subprocess.CalledProcessError as error:
+        # All commands here are compiler/OS fixture commands without credentials.
+        # Preserve diagnostics instead of hiding clang errors in captured stderr.
+        if error.stdout:
+            print(error.stdout, file=sys.stderr, end="")
+        if error.stderr:
+            print(error.stderr, file=sys.stderr, end="")
+        raise
 
 
 def fourcc(value):
@@ -389,16 +417,31 @@ def dictionary_codes():
         return values.pop()
 
     codes = {"document": fourcc(unique("class", "document"))}
-    # Restrict properties to document definitions/extensions, not all app classes.
+    # Follow only document definitions, extensions and their declared ancestors.
+    # Do not borrow a same-named property from an unrelated window/player class.
+    document_classes = {"document"}
+    nodes = [node for tree in roots for node in tree.iter()
+             if node.tag in ("class", "class-extension")]
+    while True:
+        inherited = {node.attrib["inherits"] for node in nodes
+                     if node.attrib.get("name") in document_classes and "inherits" in node.attrib}
+        if inherited <= document_classes:
+            break
+        document_classes.update(inherited)
+    relevant = [node for node in nodes
+                if (node.tag == "class" and node.attrib.get("name") in document_classes)
+                or (node.tag == "class-extension" and node.attrib.get("extends") in document_classes)]
+    print("QuickTime document dictionary: " + json.dumps([
+        {"tag": node.tag, "attributes": node.attrib,
+         "properties": [prop.attrib for prop in node.findall("property")]}
+        for node in relevant
+    ], sort_keys=True), flush=True)
     properties = {}
-    for tree in roots:
-        for node in tree.iter():
-            if ((node.tag == "class" and node.attrib.get("name") == "document")
-                    or (node.tag == "class-extension" and node.attrib.get("extends") == "document")):
-                for prop in node.findall("property"):
-                    if "name" in prop.attrib and "code" in prop.attrib:
-                        properties.setdefault(prop.attrib["name"].casefold(), set()).add(prop.attrib["code"])
-    for out, name in (("id", "id"), ("playing", "playing"), ("current_time", "current time")):
+    for node in relevant:
+        for prop in node.findall("property"):
+            if "name" in prop.attrib and "code" in prop.attrib:
+                properties.setdefault(prop.attrib["name"].casefold(), set()).add(prop.attrib["code"])
+    for out, name in (("playing", "playing"), ("current_time", "current time")):
         values = properties.get(name, set())
         if len(values) != 1:
             raise RuntimeError(f"Unsupported/ambiguous document property {name}: {values}")

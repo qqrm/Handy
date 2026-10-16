@@ -19,7 +19,7 @@ const PLAYER: &str = "org.mpris.MediaPlayer2.Player";
 const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 const READ_TIMEOUT: Duration = Duration::from_millis(500);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_SESSIONS: usize = 32;
+const MAX_SESSIONS: usize = MAX_MEDIA_LEASES;
 
 // The dedicated executor keeps signals and outstanding replies moving while the
 // recording worker waits for its next command. It never runs on the UI thread.
@@ -123,6 +123,22 @@ struct Session {
 }
 
 impl Session {
+    // Losing a well-known name revokes permission for NEW commands, but cannot
+    // prove that an already-delivered request on the original connection ended.
+    fn owns_service_name(&self) -> MediaResult<bool> {
+        bounded(READ_TIMEOUT, async {
+            let dbus = zbus::fdo::DBusProxy::new(&self.connection)
+                .await
+                .map_err(error)?;
+            let name = BusName::try_from(self.service.as_str()).map_err(error)?;
+            match dbus.get_name_owner(name).await {
+                Ok(owner) => Ok(owner == self.owner),
+                Err(zbus::fdo::Error::NameHasNoOwner(_)) => Ok(false),
+                Err(error) => Err(error.to_string()),
+            }
+        })
+    }
+
     async fn proxy(&self) -> zbus::Result<Proxy<'static>> {
         zbus::proxy::Builder::new(&self.connection)
             .destination(self.owner.clone())?
@@ -155,7 +171,7 @@ impl Session {
     }
 
     fn command(&self, method: &'static str, capability: &'static str) -> MediaResult<MediaOperation> {
-        if !self.is_live()? {
+        if !self.owns_service_name()? {
             return Ok(completed_operation(Ok(false)));
         }
         let allowed = bounded(READ_TIMEOUT, async {
@@ -163,25 +179,52 @@ impl Session {
             Ok(proxy.get_property::<bool>("CanControl").await.map_err(error)?
                 && proxy.get_property::<bool>(capability).await.map_err(error)?)
         })?;
-        if !allowed || !self.is_live()? {
+        if !allowed || !self.owns_service_name()? {
             return Ok(completed_operation(Ok(false)));
         }
         self.fence()?;
         let connection = self.connection.clone();
         let owner = self.owner.clone();
+        let service = self.service.clone();
         let (done, receiver) = mpsc::channel();
         let task = runtime()?.spawn(async move {
-            let result = async {
+            // Recheck in the task as well: it may be scheduled after the caller
+            // checked identity. All failures here precede command submission.
+            let prepared = tokio::time::timeout(READ_TIMEOUT, async {
+                let dbus = zbus::fdo::DBusProxy::new(&connection)
+                    .await
+                    .map_err(error)?;
+                let name = BusName::try_from(service.as_str()).map_err(error)?;
+                match dbus.get_name_owner(name).await {
+                    Ok(current_owner) if current_owner == owner => {}
+                    Ok(_) | Err(zbus::fdo::Error::NameHasNoOwner(_)) => return Ok(None),
+                    Err(problem) => return Err(problem.to_string()),
+                }
                 let proxy: Proxy<'static> = zbus::proxy::Builder::new(&connection)
-                    .destination(owner)?
-                    .path(PATH)?
-                    .interface(PLAYER)?
+                    .destination(owner).map_err(error)?
+                    .path(PATH).map_err(error)?
+                    .interface(PLAYER).map_err(error)?
                     .cache_properties(CacheProperties::No)
                     .build()
-                    .await?;
-                proxy.call_method(method, &()).await
-            }
-            .await;
+                    .await.map_err(error)?;
+                Ok(Some(proxy))
+            }).await;
+            let proxy = match prepared {
+                Ok(Ok(Some(proxy))) => proxy,
+                Ok(Ok(None)) => {
+                    let _ = done.send(Ok(false));
+                    return;
+                }
+                Ok(Err(problem)) => {
+                    let _ = done.send(Err(problem));
+                    return;
+                }
+                Err(_) => {
+                    let _ = done.send(Err("MPRIS command identity check timed out before submission".into()));
+                    return;
+                }
+            };
+            let result = proxy.call_method(method, &()).await;
             // A reply acknowledges the method, not the playback transition.
             // Never turn a timeout/disconnection into a known failed command:
             // the already-delivered command could still take effect later.
@@ -248,12 +291,11 @@ impl MediaSession for Session {
             let dbus = zbus::fdo::DBusProxy::new(&self.connection)
                 .await
                 .map_err(error)?;
-            let name = BusName::try_from(self.service.as_str()).map_err(error)?;
-            match dbus.get_name_owner(name).await {
-                Ok(owner) => Ok(owner == self.owner),
-                Err(zbus::fdo::Error::NameHasNoOwner(_)) => Ok(false),
-                Err(error) => Err(error.to_string()),
-            }
+            // Only disappearance of this unique connection rules out delayed
+            // effects. Releasing/reassigning its well-known name is insufficient.
+            dbus.name_has_owner(self.owner.clone().into())
+                .await
+                .map_err(error)
         })
     }
 

@@ -211,7 +211,9 @@ impl PausedSession {
     fn mark_quarantine(&mut self) {
         if !self.quarantined && self.submitted.elapsed() >= ACK_DEADLINE {
             self.quarantined = true;
-            debug!("Media request remains unconfirmed; retaining its lease and suppressing new pauses");
+            debug!(
+                "Media request remains unconfirmed; retaining its lease and suppressing new pauses"
+            );
         }
     }
 
