@@ -14,7 +14,9 @@ export function planBuild({
     );
   }
   if (artifactOnly && (signBinaries || !uploadArtifacts)) {
-    throw new Error("Artifact-only mode requires unsigned, retained CI artifacts");
+    throw new Error(
+      "Artifact-only mode requires unsigned, retained CI artifacts",
+    );
   }
   if (!signBinaries && !artifactOnly) {
     throw new Error("Unsigned builds require explicit artifact-only mode");
@@ -47,7 +49,9 @@ export function prepareBuild(env) {
     uploadArtifacts: booleanInput(env, "HANDY_UPLOAD_ARTIFACTS"),
   });
   if (!env.GITHUB_OUTPUT || !env.RUNNER_TEMP) {
-    throw new Error("GitHub runner output and temporary directories are required");
+    throw new Error(
+      "GitHub runner output and temporary directories are required",
+    );
   }
   let configArgs = "";
   if (plan.overlay) {
@@ -70,6 +74,9 @@ export function prepareBuild(env) {
   return plan;
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (
+  process.argv[1] &&
+  resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+) {
   prepareBuild(process.env);
 }

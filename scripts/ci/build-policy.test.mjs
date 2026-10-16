@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { planBuild, prepareBuild } from "./build-policy.mjs";
 
-test("every release combination rejects unsigned or artifact-only publication", () => {
+test("release combinations reject unsigned or artifact-only publication", () => {
   for (const artifactOnly of [false, true]) {
     for (const signBinaries of [false, true]) {
       for (const uploadArtifacts of [false, true]) {
@@ -18,14 +18,17 @@ test("every release combination rejects unsigned or artifact-only publication", 
         if (signBinaries && !artifactOnly) {
           assert.deepEqual(planBuild(inputs), { label: "", overlay: null });
         } else {
-          assert.throws(() => planBuild(inputs), /Release assets require signing/);
+          assert.throws(
+            () => planBuild(inputs),
+            /Release assets require signing/,
+          );
         }
       }
     }
   }
 });
 
-test("unsigned builds require explicit artifact intent and retained files", () => {
+test("unsigned builds require artifact intent and retained files", () => {
   for (const inputs of [
     { artifactOnly: false, signBinaries: false, uploadArtifacts: true },
     { artifactOnly: true, signBinaries: true, uploadArtifacts: true },
@@ -35,8 +38,11 @@ test("unsigned builds require explicit artifact intent and retained files", () =
   }
 });
 
-test("ephemeral artifact overlay changes neither production identity nor updater trust", () => {
-  const configPath = new URL("../../src-tauri/tauri.conf.json", import.meta.url);
+test("artifact overlay preserves production identity and updater trust", () => {
+  const configPath = new URL(
+    "../../src-tauri/tauri.conf.json",
+    import.meta.url,
+  );
   const before = readFileSync(configPath);
   const directory = mkdtempSync(join(tmpdir(), "handy-build-policy-"));
   try {
@@ -109,7 +115,10 @@ test("signed release creates no artifact overlay or unsigned label", () => {
       GITHUB_OUTPUT: output,
     });
     assert.deepEqual(readdirSync(directory), ["outputs"]);
-    assert.equal(readFileSync(output, "utf8"), "config-args=\nartifact-label=\n");
+    assert.equal(
+      readFileSync(output, "utf8"),
+      "config-args=\nartifact-label=\n",
+    );
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
