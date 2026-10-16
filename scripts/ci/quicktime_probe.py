@@ -2,12 +2,18 @@
 """Hosted-only real QuickTime Apple Events diagnostic. Never a product backend.
 
 Run on a fresh standard macos-15-intel or macos-26 GitHub VM:
-  HANDY_RUN_ISOLATED_QUICKTIME_TESTS=1 python3 scripts/quicktime_probe.py
+  HANDY_RUN_ISOLATED_QUICKTIME_TESTS=1 python3 scripts/ci/quicktime_probe.py
 
 Requires Xcode command-line tools. Writes quicktime-probe-result.json in
 RUNNER_TEMP. No network media, private frameworks, input injection, global
 play/pause keys, or TCC database changes. The exact QuickTime consent dialog
 may be accepted on this isolated VM. Denial/timeouts fail, never skip.
+
+QuickTime returns name-based document references. Playback targets here are
+instead the unevaluated document property of a unique-ID window, guarded by
+the original process launch and unchanged file URL. This is window identity,
+not a universal media-session token; same-file replacement inside a surviving
+window and unobserved user Play/Pause overrides are outside this diagnostic.
 """
 import hashlib
 import json
@@ -39,6 +45,15 @@ static NSAppleEventDescriptor *target;
 static NSString *receipt;
 static BOOL ownsPlayer = NO;
 static NSInteger playbackCommands = 0;
+
+@interface ProbeTarget : NSObject
+@property(nonatomic, strong) NSAppleEventDescriptor *window;
+@property(nonatomic, strong) NSAppleEventDescriptor *document;
+@property(nonatomic, strong) NSAppleEventDescriptor *windowID;
+@property(nonatomic, strong) NSURL *file;
+@end
+@implementation ProbeTarget
+@end
 
 static void probeRequire(BOOL ok, NSString *why) {
     if (!ok) @throw [NSException exceptionWithName:@"ProbeFailure" reason:why userInfo:nil];
@@ -102,70 +117,112 @@ static NSAppleEventDescriptor *property(NSAppleEventDescriptor *doc, OSType prop
     return get(spec(cProperty, doc, formPropertyID,
         [NSAppleEventDescriptor descriptorWithTypeCode:propertyCode]));
 }
-static NSAppleEventDescriptor *documents(void) {
+static NSAppleEventDescriptor *objects(OSType objectClass) {
     OSType ordinal = kAEAll;
-    NSAppleEventDescriptor *list = get(spec(code(@"document"), nil, formAbsolutePosition,
+    NSAppleEventDescriptor *list = get(spec(objectClass, nil, formAbsolutePosition,
         [NSAppleEventDescriptor descriptorWithDescriptorType:typeAbsoluteOrdinal
             bytes:&ordinal length:sizeof(ordinal)]));
-    probeRequire(list.descriptorType == typeAEList, @"Documents reply is not a list");
+    probeRequire(list.descriptorType == typeAEList, @"Object enumeration reply is not a list");
     return list;
 }
-static NSAppleEventDescriptor *documentIdentity(NSAppleEventDescriptor *doc) {
-    // Cocoa may return an ID-based reference without declaring an `id`
-    // property in the app's scripting dictionary. Inspect the actual reference;
-    // never treat an index or display name as a durable document identity.
-    NSAppleEventDescriptor *resolved = get(doc);
-    report[@"last_document_reference"] = resolved.description ?: @"(no descriptor description)";
+static NSAppleEventDescriptor *documents(void) { return objects(code(@"document")); }
+static NSAppleEventDescriptor *windowIdentity(NSAppleEventDescriptor *window) {
+    NSAppleEventDescriptor *resolved = get(window);
+    report[@"last_window_reference"] = resolved.description ?: @"(no descriptor description)";
     probeRequire(resolved.descriptorType == typeObjectSpecifier,
-        @"QuickTime did not return a document object specifier");
+        @"QuickTime did not return a window object specifier");
     NSAppleEventDescriptor *record = [resolved coerceToDescriptorType:typeAERecord];
     NSAppleEventDescriptor *kind = [record descriptorForKeyword:keyAEDesiredClass];
     NSAppleEventDescriptor *form = [record descriptorForKeyword:keyAEKeyForm];
     NSAppleEventDescriptor *container = [record descriptorForKeyword:keyAEContainer];
     NSAppleEventDescriptor *identity = [record descriptorForKeyword:keyAEKeyData];
-    probeRequire(record && kind.descriptorType == typeType && kind.typeCodeValue == code(@"document") &&
+    probeRequire(record && kind.descriptorType == typeType && kind.typeCodeValue == code(@"window") &&
         form.descriptorType == typeEnumerated && form.enumCodeValue == formUniqueID &&
         container && container.descriptorType == typeNull && identity &&
         identity.descriptorType != typeNull && identity.data.length > 0,
-        @"QuickTime reference lacks a stable formUniqueID document identity; no name/index fallback");
+        @"QuickTime window lacks formUniqueID identity; no name/index fallback");
     return identity;
 }
-static NSAppleEventDescriptor *freeze(NSAppleEventDescriptor *doc) {
-    NSAppleEventDescriptor *identity = documentIdentity(doc);
-    NSAppleEventDescriptor *frozen = spec(code(@"document"), nil, formUniqueID, identity);
-    NSAppleEventDescriptor *roundtrip = documentIdentity(frozen);
-    probeRequire(identity.descriptorType == roundtrip.descriptorType && [identity.data isEqual:roundtrip.data],
-        @"Document ID did not roundtrip through formUniqueID");
-    return frozen;
+static BOOL sameDescriptor(NSAppleEventDescriptor *a, NSAppleEventDescriptor *b) {
+    return a && b && a.descriptorType == b.descriptorType && [a.data isEqual:b.data];
 }
-static NSString *identity(NSAppleEventDescriptor *doc) {
-    NSAppleEventDescriptor *value = documentIdentity(doc);
-    return [NSString stringWithFormat:@"%08x:%@", (unsigned)value.descriptorType,
-        [value.data base64EncodedStringWithOptions:0]];
+static NSAppleEventDescriptor *windowDocument(NSAppleEventDescriptor *window) {
+    // Keep the property specifier unevaluated. Resolving it and using the reply
+    // as a command target would turn it back into a mutable document name.
+    return spec(cProperty, window, formPropertyID,
+        [NSAppleEventDescriptor descriptorWithTypeCode:code(@"window_document")]);
 }
-static BOOL playing(NSAppleEventDescriptor *doc) {
-    NSAppleEventDescriptor *value = [property(doc, code(@"playing")) coerceToDescriptorType:typeBoolean];
+static NSURL *documentFile(NSAppleEventDescriptor *doc) {
+    NSAppleEventDescriptor *value = [property(doc, code(@"file")) coerceToDescriptorType:typeFileURL];
+    NSURL *url = value.fileURLValue;
+    probeRequire(value && url && url.isFileURL, @"Document has no concrete local file URL");
+    return url.URLByStandardizingPath;
+}
+static void guardTarget(ProbeTarget *target) {
+    probeRequire(sameDescriptor(windowIdentity(target.window), target.windowID), @"Window identity changed");
+    probeRequire([documentFile(target.document) isEqual:target.file], @"Window document/file association changed");
+}
+static ProbeTarget *freeze(NSAppleEventDescriptor *doc) {
+    report[@"last_document_reference"] = get(doc).description ?: @"(no descriptor description)";
+    NSURL *file = documentFile(doc); // Read-only discovery, never a playback target.
+    NSAppleEventDescriptor *windows = objects(code(@"window"));
+    ProbeTarget *found = nil;
+    for (NSInteger index = 1; index <= windows.numberOfItems; ++index) {
+        NSAppleEventDescriptor *window = [windows descriptorAtIndex:index];
+        NSAppleEventDescriptor *windowID = windowIdentity(window);
+        probeRequire(sameDescriptor(windowID, property(window, code(@"window_id"))),
+            @"Window ID property disagrees with its returned unique-ID specifier");
+        NSAppleEventDescriptor *frozen = spec(code(@"window"), nil, formUniqueID, windowID);
+        NSAppleEventDescriptor *association = windowDocument(frozen);
+        if ([documentFile(association) isEqual:file]) {
+            probeRequire(found == nil, @"More than one window owns the fixture file; target is ambiguous");
+            found = [ProbeTarget new];
+            found.window = frozen;
+            found.document = association;
+            found.windowID = windowID;
+            found.file = file;
+            guardTarget(found);
+        }
+    }
+    probeRequire(found != nil, @"No uniquely identified window owns the fixture document");
+    return found;
+}
+static NSString *identity(ProbeTarget *target) {
+    guardTarget(target);
+    return [NSString stringWithFormat:@"window:%08x:%@|file:%@", (unsigned)target.windowID.descriptorType,
+        [target.windowID.data base64EncodedStringWithOptions:0], target.file.absoluteString];
+}
+static NSAppleEventDescriptor *targetProperty(ProbeTarget *target, OSType propertyCode) {
+    guardTarget(target);
+    NSAppleEventDescriptor *value = property(target.document, propertyCode);
+    guardTarget(target);
+    return value;
+}
+static BOOL playing(ProbeTarget *doc) {
+    NSAppleEventDescriptor *value = [targetProperty(doc, code(@"playing")) coerceToDescriptorType:typeBoolean];
     probeRequire(value != nil, @"Playing property is not boolean");
     return value.booleanValue;
 }
-static double position(NSAppleEventDescriptor *doc) {
-    NSAppleEventDescriptor *value = [property(doc, code(@"current_time"))
+static double position(ProbeTarget *doc) {
+    NSAppleEventDescriptor *value = [targetProperty(doc, code(@"current_time"))
         coerceToDescriptorType:typeIEEE64BitFloatingPoint];
     probeRequire(value != nil && isfinite(value.doubleValue), @"Current time is not finite numeric data");
     return value.doubleValue;
 }
-static void command(NSString *name, NSAppleEventDescriptor *doc) {
+static void command(NSString *name, ProbeTarget *doc) {
+    guardTarget(doc);
     playbackCommands += 1;
-    sendAppleEvent(code([name stringByAppendingString:@"_class"]), code([name stringByAppendingString:@"_id"]), doc, NO);
+    sendAppleEvent(code([name stringByAppendingString:@"_class"]), code([name stringByAppendingString:@"_id"]), doc.document, NO);
+    guardTarget(doc);
 }
-static void waitState(NSAppleEventDescriptor *doc, BOOL expected) {
+static void waitState(ProbeTarget *doc, BOOL expected) {
     for (int i = 0; i < 30; ++i) {
         if (playing(doc) == expected) return;
         [NSThread sleepForTimeInterval:0.1];
     }
     probeRequire(NO, @"Player did not acknowledge requested playback state");
 }
-static double assertAdvancing(NSAppleEventDescriptor *doc, NSString *name) {
+static double assertAdvancing(ProbeTarget *doc, NSString *name) {
     waitState(doc, YES);
     double before = position(doc);
     [NSThread sleepForTimeInterval:1.25];
@@ -175,7 +232,7 @@ static double assertAdvancing(NSAppleEventDescriptor *doc, NSString *name) {
     recordCheck(name, @{@"before_seconds": @(before), @"after_seconds": @(after)});
     return after;
 }
-static double assertPaused(NSAppleEventDescriptor *doc, NSString *name) {
+static double assertPaused(ProbeTarget *doc, NSString *name) {
     waitState(doc, NO);
     [NSThread sleepForTimeInterval:0.15];
     double before = position(doc);
@@ -238,7 +295,7 @@ static void runProbe(void) {
     probeRequire(documents().numberOfItems == 0, @"Unexpected preexisting QuickTime documents");
     probeRequire(playbackCommands == 0, @"No-media probe unexpectedly sent a playback command");
     recordCheck(@"no_media", @{@"documents": @0, @"play_or_pause_commands_sent": @(playbackCommands)});
-    NSAppleEventDescriptor *a = freeze([openFile(cfg[@"file_a"], 1) descriptorAtIndex:1]);
+    ProbeTarget *a = freeze([openFile(cfg[@"file_a"], 1) descriptorAtIndex:1]);
     NSString *aID = identity(a);
     command(@"play", a);
     assertAdvancing(a, @"explicit_play_advances");
@@ -246,9 +303,9 @@ static void runProbe(void) {
     assertPaused(a, @"explicit_pause_stops");
 
     NSAppleEventDescriptor *both = openFile(cfg[@"file_b"], 2);
-    NSAppleEventDescriptor *b = nil;
+    ProbeTarget *b = nil;
     for (NSInteger index = 1; index <= both.numberOfItems; ++index) {
-        NSAppleEventDescriptor *candidate = freeze([both descriptorAtIndex:index]);
+        ProbeTarget *candidate = freeze([both descriptorAtIndex:index]);
         if (![identity(candidate) isEqualToString:aID]) {
             probeRequire(b == nil, @"More than one unexpected document");
             b = candidate;
@@ -260,13 +317,13 @@ static void runProbe(void) {
     assertPaused(b, @"second_document_paused");
     probeRequire(!playing(a), @"Opening the second document unexpectedly resumed the first");
     double bBefore = position(b);
-    command(@"play", a); // Frozen formUniqueID, never document 1 or global toggle.
+    command(@"play", a); // Document of frozen window ID, never document 1 or a global toggle.
     assertAdvancing(a, @"same_document_resume_advances");
     double bAfter = position(b);
     probeRequire(!playing(b) && fabs(bAfter - bBefore) < 0.10 &&
         [identity(a) isEqualToString:aID] && [identity(b) isEqualToString:bID],
         @"Resume affected a different document or document identity changed");
-    recordCheck(@"same_document_identity", @{@"resumed_id": aID, @"untouched_id": bID,
+    recordCheck(@"same_window_file_association", @{@"resumed_id": aID, @"untouched_id": bID,
         @"other_before_seconds": @(bBefore), @"other_after_seconds": @(bAfter)});
     command(@"pause", a);
     assertPaused(a, @"cleanup_pause");
@@ -274,8 +331,8 @@ static void runProbe(void) {
     // implementation cannot satisfy this assertion and the untouched guard.
     NSAppleEventDescriptor *ordered = documents();
     probeRequire(ordered.numberOfItems == 2, @"Unexpected document count before index-isolation case");
-    NSAppleEventDescriptor *nonFirst = freeze([ordered descriptorAtIndex:2]);
-    NSAppleEventDescriptor *first = freeze([ordered descriptorAtIndex:1]);
+    ProbeTarget *nonFirst = freeze([ordered descriptorAtIndex:2]);
+    ProbeTarget *first = freeze([ordered descriptorAtIndex:1]);
     NSString *savedID = identity(nonFirst);
     probeRequire(!playing(first) && !playing(nonFirst), @"Index-isolation setup was not paused");
     double firstBefore = position(first);
@@ -289,8 +346,32 @@ static void runProbe(void) {
     assertAdvancing(nonFirst, @"nonfirst_document_resume_advances");
     probeRequire([identity(nonFirst) isEqualToString:savedID] && !playing(first) &&
         fabs(position(first) - firstBefore) < 0.10, @"Resume affected document 1");
-    recordCheck(@"nonfirst_document_identity", @{@"resumed_id": savedID, @"untouched_id": identity(first)});
+    recordCheck(@"nonfirst_window_file_association", @{@"resumed_id": savedID, @"untouched_id": identity(first)});
     command(@"pause", nonFirst);
+    // Closing and reopening the same file must not let the stale window target
+    // resume its replacement, even though both the document name and URL match.
+    sendAppleEvent(kAECoreSuite, kAEClose, nonFirst.window, NO);
+    for (int i = 0; i < 30 && documents().numberOfItems != 1; ++i)
+        [NSThread sleepForTimeInterval:0.1];
+    probeRequire(documents().numberOfItems == 1, @"Old window did not close");
+    NSAppleEventDescriptor *reopened = openFile(nonFirst.file.path, 2);
+    ProbeTarget *replacement = nil;
+    for (NSInteger index = 1; index <= reopened.numberOfItems; ++index) {
+        ProbeTarget *candidate = freeze([reopened descriptorAtIndex:index]);
+        if ([candidate.file isEqual:nonFirst.file]) replacement = candidate;
+    }
+    probeRequire(replacement && !sameDescriptor(replacement.windowID, nonFirst.windowID),
+        @"Reopened fixture did not obtain a distinct window identity");
+    NSInteger beforeRejectedCommand = playbackCommands;
+    BOOL rejected = NO;
+    NSString *rejection = nil;
+    @try { command(@"play", nonFirst); }
+    @catch (NSException *error) { rejected = YES; rejection = error.reason; }
+    probeRequire(rejected && playbackCommands == beforeRejectedCommand,
+        @"Stale target was not rejected before sending playback");
+    assertPaused(replacement, @"replacement_remains_paused");
+    recordCheck(@"closed_window_target_rejected", @{@"old_window_id": savedID,
+        @"replacement_id": identity(replacement), @"reason": rejection ?: @"unknown"});
     report[@"status"] = @"passed";
     report[@"phase"] = @"complete";
 }
@@ -309,6 +390,8 @@ int main(int argc, const char **argv) {
         checks = [NSMutableArray array];
         report = [@{@"status": @"running", @"phase": @"initializing",
             @"scope": @"Public PID-addressed Apple Events and actual QuickTime only; not Handy backend coverage",
+            @"identity_mode": @"PID + launch date + window unique ID + unchanged file URL",
+            @"identity_limit": @"A guarded window/file association, not a universal media-session token; in-place replacement by the same file is not observable.",
             @"probe_pid": @(getpid()), @"os": NSProcessInfo.processInfo.operatingSystemVersionString,
             @"codes": cfg[@"codes"], @"sdef_sha256": cfg[@"sdef_sha256"]} mutableCopy];
         [NSApplication sharedApplication];
@@ -416,36 +499,44 @@ def dictionary_codes():
             raise RuntimeError(f"Unsupported/ambiguous installed dictionary {tag} {name}: {values}")
         return values.pop()
 
-    codes = {"document": fourcc(unique("class", "document"))}
-    # Follow only document definitions, extensions and their declared ancestors.
-    # Do not borrow a same-named property from an unrelated window/player class.
-    document_classes = {"document"}
+    codes = {name: fourcc(unique("class", name)) for name in ("document", "window")}
     nodes = [node for tree in roots for node in tree.iter()
              if node.tag in ("class", "class-extension")]
-    while True:
-        inherited = {node.attrib["inherits"] for node in nodes
-                     if node.attrib.get("name") in document_classes and "inherits" in node.attrib}
-        if inherited <= document_classes:
-            break
-        document_classes.update(inherited)
-    relevant = [node for node in nodes
-                if (node.tag == "class" and node.attrib.get("name") in document_classes)
-                or (node.tag == "class-extension" and node.attrib.get("extends") in document_classes)]
-    print("QuickTime document dictionary: " + json.dumps([
-        {"tag": node.tag, "attributes": node.attrib,
-         "properties": [prop.attrib for prop in node.findall("property")]}
-        for node in relevant
-    ], sort_keys=True), flush=True)
-    properties = {}
-    for node in relevant:
-        for prop in node.findall("property"):
-            if "name" in prop.attrib and "code" in prop.attrib:
-                properties.setdefault(prop.attrib["name"].casefold(), set()).add(prop.attrib["code"])
-    for out, name in (("playing", "playing"), ("current_time", "current time")):
-        values = properties.get(name, set())
-        if len(values) != 1:
-            raise RuntimeError(f"Unsupported/ambiguous document property {name}: {values}")
-        codes[out] = fourcc(values.pop())
+
+    def class_properties(class_name):
+        # Follow only this class's declared inheritance, never unrelated classes.
+        classes = {class_name}
+        while True:
+            inherited = {node.attrib["inherits"] for node in nodes
+                         if node.attrib.get("name") in classes and "inherits" in node.attrib}
+            if inherited <= classes:
+                break
+            classes.update(inherited)
+        relevant = [node for node in nodes
+                    if (node.tag == "class" and node.attrib.get("name") in classes)
+                    or (node.tag == "class-extension" and node.attrib.get("extends") in classes)]
+        print(f"QuickTime {class_name} dictionary: " + json.dumps([
+            {"tag": node.tag, "attributes": node.attrib,
+             "properties": [prop.attrib for prop in node.findall("property")]}
+            for node in relevant
+        ], sort_keys=True), flush=True)
+        properties = {}
+        for node in relevant:
+            for prop in node.findall("property"):
+                if "name" in prop.attrib and "code" in prop.attrib:
+                    properties.setdefault(prop.attrib["name"].casefold(), set()).add(prop.attrib["code"])
+        return properties
+
+    for class_name, requested in (
+        ("document", (("playing", "playing"), ("current_time", "current time"), ("file", "file"))),
+        ("window", (("window_id", "id"), ("window_document", "document"))),
+    ):
+        properties = class_properties(class_name)
+        for out, name in requested:
+            values = properties.get(name, set())
+            if len(values) != 1:
+                raise RuntimeError(f"Unsupported/ambiguous {class_name} property {name}: {values}")
+            codes[out] = fourcc(values.pop())
     for command in ("play", "pause"):
         event = unique("command", command)
         if len(event) != 8:
@@ -543,6 +634,7 @@ def main():
                 "Real QuickTime transport fixture only; no Handy product backend executed.",
                 "Not proof of all-player support or lossless detection of user play-pause overrides.",
                 "PID plus launch identity reduces restart retargeting; checks are not an atomic OS session capability.",
+                "Window unique ID plus unchanged file URL is not a universal media-session token; same-file in-place replacement is not observable.",
             ]
         finally:
             try:

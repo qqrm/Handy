@@ -75,8 +75,12 @@ protocol service tests delayed replies and signal ordering. The product adapter
 uses zbus directly and requires neither VLC nor playerctl.
 
 The macOS experiment uses only public PID-addressed Apple Events, launch identity,
-and frozen QuickTime document IDs. It measures actual position movement and
-checks that a second/non-first document is not accidentally retargeted. It may
+and a frozen QuickTime window ID with an unchanged file association. QuickTime
+returns documents by name, which is not a stable playback identity. The probe
+instead targets the document property of the original window and rejects a
+closed/reopened window. Same-file replacement inside a surviving window remains
+unobservable; this is not a universal media-session token. It measures actual
+position movement and checks a second/non-first document is not retargeted. It may
 accept only the exact probe-to-QuickTime consent dialog inside the fresh VM;
 it never modifies the TCC database or sends global media keys. Missing consent,
 a missing receipt, a timeout, or a non-advancing clock fails the check.
