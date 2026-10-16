@@ -193,10 +193,16 @@ fn wait_state(session: &Session, expected: PlaybackState, stage: &str) {
 fn user_command(session: &Session, method: &str) {
     // Simulate an external user explicitly, outside automatic resume ownership.
     bounded(SETUP_TIMEOUT, async {
-        session.proxy().await.map_err(error)?
-            .call_method(method, &()).await.map_err(error)?;
+        session
+            .proxy()
+            .await
+            .map_err(error)?
+            .call_method(method, &())
+            .await
+            .map_err(error)?;
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
 }
 
 fn position(session: &Session) -> i64 {
@@ -506,13 +512,21 @@ fn isolated_linux_dbus_delayed_ack_and_signal_ownership() {
     let controller =
         MediaPauseController::with_backend(Arc::new(OnlyFixtures(vec![session.clone()])));
     start(&controller, 102);
-    wait_state(&session, PlaybackState::Paused, "before gated resume preflight");
-    started.recv_timeout(Duration::from_secs(3)).expect("Preflight scenario Pause reached service");
+    wait_state(
+        &session,
+        PlaybackState::Paused,
+        "before gated resume preflight",
+    );
+    started
+        .recv_timeout(Duration::from_secs(3))
+        .expect("Preflight scenario Pause reached service");
     let (preflight_started, preflight) = mpsc::channel();
     let (release_preflight, gate) = oneshot::channel();
     *state.play_preflight.lock().unwrap() = Some((preflight_started, gate));
     controller.remove();
-    preflight.recv_timeout(Duration::from_secs(3)).expect("Auto Play reached CanPlay preflight");
+    preflight
+        .recv_timeout(Duration::from_secs(3))
+        .expect("Auto Play reached CanPlay preflight");
     emit_status(&connection, &state, 0);
     emit_status(&connection, &state, 1);
     release_preflight.send(()).unwrap();
@@ -520,7 +534,11 @@ fn isolated_linux_dbus_delayed_ack_and_signal_ownership() {
     drop(controller);
     assert_eq!(state.status.load(Ordering::SeqCst), 1);
     assert_eq!(state.pause_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(state.play_calls.load(Ordering::SeqCst), 1, "User override during preflight forbids automatic Play");
+    assert_eq!(
+        state.play_calls.load(Ordering::SeqCst),
+        1,
+        "User override during preflight forbids automatic Play"
+    );
 
     let ownership = Arc::new(PauseOwnership::default());
     let watch = session.watch(ownership.clone()).unwrap();

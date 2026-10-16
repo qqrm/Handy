@@ -146,6 +146,16 @@ static NSAppleEventDescriptor *windowIdentity(NSAppleEventDescriptor *window) {
 static BOOL sameDescriptor(NSAppleEventDescriptor *a, NSAppleEventDescriptor *b) {
     return a && b && a.descriptorType == b.descriptorType && [a.data isEqual:b.data];
 }
+static NSAppleEventDescriptor *canonicalInteger(NSAppleEventDescriptor *value) {
+    // Do not accept strings, floats or lossy narrowing. Apple Events may encode
+    // the same positive window ID using different signed integer widths.
+    DescType kind = value.descriptorType;
+    probeRequire(value && (kind == typeSInt16 || kind == typeSInt32 ||
+        kind == typeUInt32 || kind == typeSInt64), @"Window ID is not a supported integral descriptor");
+    NSAppleEventDescriptor *canonical = [value coerceToDescriptorType:typeSInt64];
+    probeRequire(canonical && canonical.data.length == sizeof(SInt64), @"Window ID could not be normalized losslessly");
+    return canonical;
+}
 static NSAppleEventDescriptor *windowDocument(NSAppleEventDescriptor *window) {
     // Keep the property specifier unevaluated. Resolving it and using the reply
     // as a command target would turn it back into a mutable document name.
@@ -170,7 +180,12 @@ static ProbeTarget *freeze(NSAppleEventDescriptor *doc) {
     for (NSInteger index = 1; index <= windows.numberOfItems; ++index) {
         NSAppleEventDescriptor *window = [windows descriptorAtIndex:index];
         NSAppleEventDescriptor *windowID = windowIdentity(window);
-        probeRequire(sameDescriptor(windowID, property(window, code(@"window_id"))),
+        NSAppleEventDescriptor *declaredID = property(window, code(@"window_id"));
+        report[@"window_id_reference"] = @{@"descriptor": windowID.description ?: @"nil",
+            @"type": @(windowID.descriptorType)};
+        report[@"window_id_property"] = @{@"descriptor": declaredID.description ?: @"nil",
+            @"type": @(declaredID.descriptorType)};
+        probeRequire(sameDescriptor(canonicalInteger(windowID), canonicalInteger(declaredID)),
             @"Window ID property disagrees with its returned unique-ID specifier");
         NSAppleEventDescriptor *frozen = spec(code(@"window"), nil, formUniqueID, windowID);
         NSAppleEventDescriptor *association = windowDocument(frozen);

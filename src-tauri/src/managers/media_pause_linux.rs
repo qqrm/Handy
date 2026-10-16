@@ -185,7 +185,10 @@ impl Session {
         let owner = self.owner.clone();
         let service = self.service.clone();
         let play_watch = if method == "Play" {
-            self.watch.lock().unwrap_or_else(|e| e.into_inner()).upgrade()
+            self.watch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .upgrade()
         } else {
             None
         };
@@ -242,7 +245,10 @@ impl Session {
             };
             // Capability/identity requests and observer synchronization can yield
             // to a user's Play -> Pause. Revalidate at the actual dispatch point.
-            if play_watch.as_ref().is_some_and(|watch| !watch.ownership.can_resume()) {
+            if play_watch
+                .as_ref()
+                .is_some_and(|watch| !watch.ownership.can_resume())
+            {
                 let _ = done.send(Ok(false));
                 return;
             }
@@ -383,7 +389,9 @@ impl WatchControl {
             self.ownership.observe(Err(problem.clone()));
             return Err(problem);
         }
-        result.await.map_err(|_| "MPRIS observer stopped".to_string())
+        result
+            .await
+            .map_err(|_| "MPRIS observer stopped".to_string())
     }
 }
 

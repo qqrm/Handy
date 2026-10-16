@@ -38,45 +38,13 @@ jobs:
         with:
           toolchain: stable
           components: clippy, rustfmt
-      - name: Require a reviewed test dependency lockfile
-        shell: bash
-        run: |
-          set -euo pipefail
-          manifest=src-tauri/tests/media-pause/Cargo.toml
-          if ! cargo metadata --locked --format-version 1 --manifest-path "$manifest" >/dev/null; then
-            # Produce review data only; never continue tests with an uncommitted lock.
-            # Seed with the application graph: isolated tests should exercise
-            # the same resolved libraries, not silently upgrade transitive code.
-            cp src-tauri/Cargo.lock src-tauri/tests/media-pause/Cargo.lock
-            cargo metadata --format-version 1 --manifest-path "$manifest" >/dev/null
-            python3 - <<'PY'
-          import base64
-          from pathlib import Path
-          data = Path("src-tauri/tests/media-pause/Cargo.lock").read_bytes()
-          print("HANDY_REVIEW_LOCK=" + base64.b64encode(data).decode())
-          PY
-            exit 1
-          fi
       - name: Test actual shared controller and platform adapter
         run: cargo test --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml
       - name: Lint the platform test harness
         run: cargo clippy --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml --all-targets -- -D warnings
-      - name: Check formatting and return review data on failure
+      - name: Check formatting
         if: always() && matrix.platform == 'ubuntu-24.04'
-        shell: bash
-        run: |
-          if ! cargo fmt --manifest-path src-tauri/tests/media-pause/Cargo.toml -- --check; then
-            cargo fmt --manifest-path src-tauri/tests/media-pause/Cargo.toml
-            python3 - <<'PY'
-          import base64, json, subprocess
-          from pathlib import Path
-          paths = subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines()
-          reviewed = {p: base64.b64encode(Path(p).read_bytes()).decode()
-                      for p in paths if p.endswith(".rs")}
-          print("HANDY_REVIEW_FORMAT=" + json.dumps(reviewed))
-          PY
-            exit 1
-          fi
+        run: cargo fmt --manifest-path src-tauri/tests/media-pause/Cargo.toml -- --check
 
   linux-isolated-mpris:
     name: Linux isolated MPRIS (VLC and delayed replies)
