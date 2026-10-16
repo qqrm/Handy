@@ -32,6 +32,11 @@ on:
         required: false
         type: boolean
         default: false
+      artifact-only:
+        description: "Explicit unsigned CI artifacts; forbidden with release-id"
+        required: false
+        type: boolean
+        default: false
       repository:
         required: false
         type: string
@@ -53,8 +58,7 @@ env:
 
 jobs:
   build:
-    permissions:
-      contents: write
+    # Inherit caller permissions: release callers grant write, PR checks read.
     runs-on: ${{ inputs.platform }}
     steps:
       # Kept for git checkout and general tooling headroom. The native
@@ -77,6 +81,17 @@ jobs:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Enforce signing and artifact-only policy
+        id: build-policy
+        shell: bash
+        env:
+          HANDY_ARTIFACT_ONLY: ${{ inputs.artifact-only }}
+          HANDY_SIGN_BINARIES: ${{ inputs.sign-binaries }}
+          HANDY_UPLOAD_ARTIFACTS: ${{ inputs.upload-artifacts }}
+          HANDY_RELEASE_ID: ${{ inputs.release-id }}
+        run: node scripts/ci/build-policy.mjs
 
       - name: Get version from tauri.conf.json
         id: get-version
@@ -543,7 +558,7 @@ jobs:
           releaseName: ${{ inputs.release-id && format('v{0}', steps.get-version.outputs.version) || '' }}
           releaseId: ${{ inputs.release-id }}
           assetNamePattern: ${{ steps.patch-release-name.outputs.platform }}
-          args: ${{ inputs.build-args }}
+          args: ${{ inputs.build-args }} ${{ steps.build-policy.outputs.config-args }}
 
       # tauri-action uploads release assets before returning. All AppImage
       # filtering therefore happens inside linuxdeploy above; this verifies the
@@ -604,7 +619,7 @@ jobs:
         if: inputs.upload-artifacts && contains(inputs.platform, 'macos')
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ inputs.asset-prefix }}-${{ inputs.target }}
+          name: ${{ steps.build-policy.outputs.artifact-label }}${{ inputs.asset-prefix }}-${{ inputs.target }}
           path: |
             src-tauri/target/${{ inputs.target }}/${{ steps.build-profile.outputs.profile }}/bundle/dmg/*.dmg
             src-tauri/target/${{ inputs.target }}/${{ steps.build-profile.outputs.profile }}/bundle/macos/*.app
@@ -784,12 +799,35 @@ jobs:
         if: inputs.upload-artifacts && contains(inputs.platform, 'ubuntu')
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ inputs.asset-prefix }}-${{ inputs.platform }}-${{ inputs.target }}
+          name: ${{ steps.build-policy.outputs.artifact-label }}${{ inputs.asset-prefix }}-${{ inputs.platform }}-${{ inputs.target }}
           path: |
             src-tauri/target/${{ steps.build-profile.outputs.profile }}/bundle/deb/*.deb
             src-tauri/target/${{ steps.build-profile.outputs.profile }}/bundle/appimage/*.AppImage
             src-tauri/target/${{ steps.build-profile.outputs.profile }}/bundle/rpm/*.rpm
           retention-days: 30
+
+      - name: Verify unsigned test packaging has no updater signatures
+        if: inputs.artifact-only && contains(inputs.platform, 'windows')
+        shell: pwsh
+        run: |
+          $profile = '${{ steps.build-profile.outputs.profile }}'
+          $target = '${{ inputs.target }}'
+          $base = 'src-tauri/target'
+          if ($target -and $target -ne 'x86_64-pc-windows-msvc') { $base = Join-Path $base $target }
+          $base = Join-Path $base $profile
+          $msi = @(Get-ChildItem (Join-Path $base 'bundle/msi') -Filter '*.msi' -File)
+          $nsis = @(Get-ChildItem (Join-Path $base 'bundle/nsis') -Filter '*.exe' -File)
+          if ($msi.Count -eq 0 -or $nsis.Count -eq 0) { throw 'Expected both MSI and NSIS unsigned test installers' }
+          $packages = $msi + $nsis
+          foreach ($package in $packages) {
+            if ((Get-AuthenticodeSignature -LiteralPath $package.FullName).Status -ne 'NotSigned') {
+              throw "Unexpected signer on unsigned test artifact: $($package.Name)"
+            }
+          }
+          if (Get-ChildItem (Join-Path $base 'bundle') -Recurse -Filter '*.sig') {
+            throw 'Artifact-only packaging produced updater signatures'
+          }
+          Write-Output 'Verified unsigned test installers; no updater signatures produced.'
 
       # Run on Windows releases too; upload-artifacts only controls retention.
       - name: Audit Windows package runtime contents
@@ -898,7 +936,7 @@ jobs:
         if: inputs.upload-artifacts && contains(inputs.platform, 'windows')
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ inputs.asset-prefix }}-${{ inputs.target }}
+          name: ${{ steps.build-policy.outputs.artifact-label }}${{ inputs.asset-prefix }}-${{ inputs.target }}
           path: |
             src-tauri/target/${{ inputs.target != '' && inputs.target != 'x86_64-pc-windows-msvc' && format('{0}/{1}', inputs.target, steps.build-profile.outputs.profile) || steps.build-profile.outputs.profile }}/bundle/msi/*.msi
             src-tauri/target/${{ inputs.target != '' && inputs.target != 'x86_64-pc-windows-msvc' && format('{0}/{1}', inputs.target, steps.build-profile.outputs.profile) || steps.build-profile.outputs.profile }}/bundle/nsis/*.exe
