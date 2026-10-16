@@ -527,7 +527,8 @@ jobs:
           "$tools_dir/linuxdeploy-${arch}.AppImage" --appimage-extract-and-run --version
 
       - name: Build with Tauri
-        uses: tauri-apps/tauri-action@v0
+        if: '!inputs.artifact-only'
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_ID: ${{ inputs.sign-binaries && secrets.APPLE_ID || '' }}
@@ -559,9 +560,53 @@ jobs:
           assetNamePattern: ${{ steps.patch-release-name.outputs.platform }}
           args: ${{ inputs.build-args }} ${{ steps.build-policy.outputs.config-args }}
 
+      # Empty APPLE_CERTIFICATE still asks Tauri to import a certificate. Test
+      # builds must omit signing credentials entirely; macOS keeps the tracked
+      # ad-hoc identity (-), without Developer ID signing or notarization.
+      - name: Build isolated test packages without signing credentials
+        if: inputs.artifact-only
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
+        env:
+          LINUXDEPLOY_EXCLUDED_LIBRARIES: ${{ contains(inputs.platform, 'ubuntu') && 'libvulkan.so*;libwayland-client.so*' || '' }}
+          LINUXDEPLOY_OUTPUT_VERSION: ${{ contains(inputs.platform, 'ubuntu') && steps.get-version.outputs.version || '' }}
+        with:
+          assetNamePattern: ${{ steps.patch-release-name.outputs.platform }}
+          args: ${{ inputs.build-args }} ${{ steps.build-policy.outputs.config-args }}
+
       # tauri-action uploads release assets before returning. All AppImage
       # filtering therefore happens inside linuxdeploy above; this verifies the
       # exact artifact Tauri signed and uploaded.
+      - name: Verify ad-hoc macOS test package and executable
+        if: inputs.artifact-only && contains(inputs.platform, 'macos')
+        shell: bash
+        env:
+          HANDY_BUILD_TARGET: ${{ inputs.target }}
+          HANDY_BUILD_PROFILE: ${{ steps.build-profile.outputs.profile }}
+        run: |
+          set -euo pipefail
+          base="src-tauri/target/${HANDY_BUILD_TARGET}/${HANDY_BUILD_PROFILE}/bundle"
+          app="$base/macos/Handy.app"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$app/Contents/Info.plist")
+          binary="$app/Contents/MacOS/$executable"
+          case "$HANDY_BUILD_TARGET" in
+            aarch64-apple-darwin) expected_arch=arm64 ;;
+            x86_64-apple-darwin) expected_arch=x86_64 ;;
+            *) echo 'Unsupported macOS test target' >&2; exit 1 ;;
+          esac
+          test "$(lipo -archs "$binary")" = "$expected_arch"
+          codesign --verify --deep --strict "$app"
+          signature=$(codesign -dv "$app" 2>&1)
+          printf '%s\n' "$signature"
+          printf '%s\n' "$signature" | grep -q 'Signature=adhoc'
+          test -z "$(find "$base" -name '*.sig' -print -quit)"
+          python3 - "$binary" <<'PY'
+          import subprocess
+          import sys
+          result = subprocess.run([sys.argv[1], "--list-devices"], timeout=30, check=True, text=True, capture_output=True)
+          print(result.stdout)
+          print("Verified packaged macOS executable starts without signing credentials.")
+          PY
+
       - name: Verify AppImage version metadata
         if: contains(inputs.platform, 'ubuntu')
         shell: bash
