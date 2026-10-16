@@ -597,10 +597,36 @@ jobs:
           printf '%s\n' "$signature" | grep -q 'Signature=adhoc'
           test -z "$(find "$base" -name '*.sig' -print -quit)"
           python3 - "$binary" <<'PY'
+          import os
+          from pathlib import Path
           import subprocess
           import sys
-          result = subprocess.run([sys.argv[1], "--list-devices"], timeout=30, check=True, text=True, capture_output=True)
-          print(result.stdout)
+          environment = {**os.environ, "RUST_LOG": "info"}
+          for argument in ("--help", "--list-devices"):
+              print(f"Checking packaged executable {argument}", flush=True)
+              process = subprocess.Popen([sys.argv[1], argument], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment)
+              try:
+                  stdout, stderr = process.communicate(timeout=30)
+              except subprocess.TimeoutExpired:
+                  # Inspect only this job's own disposable test process. Keep
+                  # the failed runtime gate; a built/signed package is not proof
+                  # that the application initializes and exits successfully.
+                  sample = Path(os.environ["RUNNER_TEMP"]) / "handy-startup-sample.txt"
+                  try:
+                      diagnostic = subprocess.run(["/usr/bin/sample", str(process.pid), "3", "-file", str(sample)], timeout=10, capture_output=True, text=True)
+                      print(diagnostic.stdout, diagnostic.stderr, flush=True)
+                      if sample.exists():
+                          print(sample.read_text(errors="replace")[:60000], flush=True)
+                  finally:
+                      process.kill()
+                      stdout, stderr = process.communicate(timeout=5)
+                      print(stdout, stderr, flush=True)
+                  raise
+              print(stdout, stderr, flush=True)
+              if process.returncode != 0:
+                  raise SystemExit(f"Packaged executable failed {argument}: exit {process.returncode}")
+              if argument == "--help" and not all(expected in stdout for expected in ("Usage:", "--list-devices")):
+                  raise SystemExit("Packaged executable did not return the expected CLI help")
           print("Verified packaged macOS executable starts without signing credentials.")
           PY
 
