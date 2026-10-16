@@ -24,10 +24,24 @@ impl Drop for Apartment {
 pub(super) struct Backend;
 impl MediaBackend for Backend {
     fn sessions(&self) -> MediaResult<Vec<Arc<dyn MediaSession>>> {
-        let manager = SessionManager::RequestAsync()
-            .and_then(|op| op.get())
-            .map_err(|e| e.to_string())?;
+        let request = SessionManager::RequestAsync().map_err(|e| e.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        // AsyncStatus::Started is 0. The inferred WinRT operation type avoids
+        // adding a separate windows-future dependency only to name this enum.
+        while request.Status().map_err(|e| e.to_string())?.0 == 0 {
+            if Instant::now() >= deadline {
+                // This operation only enumerates; dropping it cannot pause or
+                // resume media. Cancellation remains a provider best effort.
+                let _ = request.Cancel();
+                return Err("Media manager enumeration timed out".into());
+            }
+            std::thread::sleep(FAST_POLL);
+        }
+        let manager = request.GetResults().map_err(|e| e.to_string())?;
         let sessions = manager.GetSessions().map_err(|e| e.to_string())?;
+        if sessions.Size().map_err(|e| e.to_string())? as usize > MAX_MEDIA_LEASES {
+            return Err("Media session limit exceeded; refusing a partial pause batch".into());
+        }
         Ok(sessions
             .into_iter()
             .map(|session| {
@@ -61,17 +75,21 @@ impl MediaSession for WindowsSession {
     fn state(&self) -> MediaResult<PlaybackState> {
         playback_state(&self.session)
     }
-    fn pause(&self) -> MediaResult<bool> {
-        self.session
-            .TryPauseAsync()
-            .and_then(|op| op.get())
-            .map_err(|e| e.to_string())
+    fn pause(&self) -> MediaResult<MediaOperation> {
+        let request = self.session.TryPauseAsync().map_err(|e| e.to_string())?;
+        Ok(Box::new(move || match request.Status() {
+            Ok(status) if status.0 != 0 => request.GetResults().ok().map(Ok),
+            // A status/result error is not proof that the player saw no command.
+            // Preserve the uncertain operation until this session disappears.
+            _ => None,
+        }))
     }
-    fn play(&self) -> MediaResult<bool> {
-        self.session
-            .TryPlayAsync()
-            .and_then(|op| op.get())
-            .map_err(|e| e.to_string())
+    fn play(&self) -> MediaResult<MediaOperation> {
+        let request = self.session.TryPlayAsync().map_err(|e| e.to_string())?;
+        Ok(Box::new(move || match request.Status() {
+            Ok(status) if status.0 != 0 => request.GetResults().ok().map(Ok),
+            _ => None,
+        }))
     }
     fn is_live(&self) -> MediaResult<bool> {
         // Compare the original COM object, never its app ID: one application

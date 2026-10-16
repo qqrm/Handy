@@ -527,7 +527,7 @@ jobs:
           "$tools_dir/linuxdeploy-${arch}.AppImage" --appimage-extract-and-run --version
 
       - name: Build with Tauri
-        if: '!inputs.artifact-only'
+        if: "!inputs.artifact-only"
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -573,9 +573,6 @@ jobs:
           assetNamePattern: ${{ steps.patch-release-name.outputs.platform }}
           args: ${{ inputs.build-args }} ${{ steps.build-policy.outputs.config-args }}
 
-      # tauri-action uploads release assets before returning. All AppImage
-      # filtering therefore happens inside linuxdeploy above; this verifies the
-      # exact artifact Tauri signed and uploaded.
       - name: Verify ad-hoc macOS test package and executable
         if: inputs.artifact-only && contains(inputs.platform, 'macos')
         shell: bash
@@ -607,6 +604,9 @@ jobs:
           print("Verified packaged macOS executable starts without signing credentials.")
           PY
 
+      # tauri-action uploads release assets before returning. All AppImage
+      # filtering therefore happens inside linuxdeploy above; this verifies the
+      # exact artifact Tauri signed and uploaded.
       - name: Verify AppImage version metadata
         if: contains(inputs.platform, 'ubuntu')
         shell: bash

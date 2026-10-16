@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Weak;
 use std::time::Duration;
 
+type Completion = Arc<Mutex<Option<MediaResult<bool>>>>;
+
 struct FakeSession {
     state: Mutex<MediaResult<PlaybackState>>,
     observer: Mutex<Weak<PauseOwnership>>,
@@ -13,6 +15,10 @@ struct FakeSession {
     pause_calls: AtomicUsize,
     play_calls: AtomicUsize,
     pause_gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    defer_pause_state: bool,
+    defer_play_state: bool,
+    pause_completion: Option<Completion>,
+    play_completion: Option<Completion>,
 }
 
 impl FakeSession {
@@ -27,6 +33,10 @@ impl FakeSession {
             pause_calls: AtomicUsize::new(0),
             play_calls: AtomicUsize::new(0),
             pause_gate: Mutex::new(None),
+            defer_pause_state: false,
+            defer_play_state: false,
+            pause_completion: None,
+            play_completion: None,
         }
     }
     fn change(&self, state: MediaResult<PlaybackState>) {
@@ -52,23 +62,33 @@ impl MediaSession for FakeSession {
     fn is_live(&self) -> MediaResult<bool> {
         Ok(self.live.load(Ordering::SeqCst))
     }
-    fn pause(&self) -> MediaResult<bool> {
+    fn pause(&self) -> MediaResult<MediaOperation> {
         self.pause_calls.fetch_add(1, Ordering::SeqCst);
         if let Some((entered, release)) = self.pause_gate.lock().unwrap().take() {
             entered.send(()).unwrap();
             release.recv_timeout(Duration::from_secs(5)).unwrap();
         }
-        if self.pause_result == Ok(true) {
+        if self.pause_result == Ok(true) && !self.defer_pause_state {
             self.change(Ok(PlaybackState::Paused));
         }
-        self.pause_result.clone()
+        if let Some(completion) = &self.pause_completion {
+            let completion = completion.clone();
+            Ok(Box::new(move || completion.lock().unwrap().take()))
+        } else {
+            Ok(completed_operation(self.pause_result.clone()))
+        }
     }
-    fn play(&self) -> MediaResult<bool> {
+    fn play(&self) -> MediaResult<MediaOperation> {
         self.play_calls.fetch_add(1, Ordering::SeqCst);
-        if self.play_result == Ok(true) {
+        if self.play_result == Ok(true) && !self.defer_play_state {
             self.change(Ok(PlaybackState::Playing));
         }
-        self.play_result.clone()
+        if let Some(completion) = &self.play_completion {
+            let completion = completion.clone();
+            Ok(Box::new(move || completion.lock().unwrap().take()))
+        } else {
+            Ok(completed_operation(self.play_result.clone()))
+        }
     }
     fn watch(&self, observer: Arc<PauseOwnership>) -> MediaResult<Box<dyn SessionWatch>> {
         if !self.watch_ok {
@@ -315,4 +335,201 @@ fn windows_enumeration_is_read_only() {
     for session in sessions {
         let _ = session.state();
     }
+}
+
+#[test]
+fn accepted_pause_with_late_state_after_end_is_restored_once() {
+    let session = Arc::new(FakeSession {
+        defer_pause_state: true,
+        ..FakeSession::new(PlaybackState::Playing)
+    });
+    let (c, _) = controller(std::slice::from_ref(&session));
+    start(&c, 1); // Method accepted, but playback has not changed yet.
+    stop(&c);
+    assert_eq!((session.pauses(), session.plays()), (1, 0));
+    session.change(Ok(PlaybackState::Paused));
+    c.flush();
+    assert_eq!((session.pauses(), session.plays()), (1, 1));
+    c.flush();
+    assert_eq!(session.plays(), 1);
+}
+
+#[test]
+fn late_successful_pause_completion_is_retained_after_end() {
+    let completion = Arc::new(Mutex::new(None));
+    let session = Arc::new(FakeSession {
+        defer_pause_state: true,
+        pause_completion: Some(completion.clone()),
+        ..FakeSession::new(PlaybackState::Playing)
+    });
+    let (c, _) = controller(std::slice::from_ref(&session));
+    start(&c, 1);
+    stop(&c);
+    session.change(Ok(PlaybackState::Paused));
+    c.flush();
+    assert_eq!(session.plays(), 0); // Do not race the unfinished Pause with Play.
+    *completion.lock().unwrap() = Some(Ok(true));
+    c.flush();
+    assert_eq!(session.plays(), 1);
+}
+
+#[test]
+fn never_finishing_pause_quarantines_new_recordings_without_blocking_commands() {
+    let completion = Arc::new(Mutex::new(None));
+    let session = Arc::new(FakeSession {
+        defer_pause_state: true,
+        pause_completion: Some(completion),
+        ..FakeSession::new(PlaybackState::Playing)
+    });
+    let (c, _) = controller(std::slice::from_ref(&session));
+    start(&c, 1);
+    stop(&c);
+    for generation in 2..50 {
+        start(&c, generation);
+        stop(&c);
+    }
+    assert_eq!((session.pauses(), session.plays()), (1, 0));
+    session.live.store(false, Ordering::SeqCst);
+    c.flush(); // Definitive disappearance releases the quarantined lease.
+}
+
+#[test]
+fn acknowledgement_deadline_keeps_original_watch_and_pending_operation() {
+    let completion = Arc::new(Mutex::new(None));
+    let session = Arc::new(FakeSession {
+        defer_pause_state: true,
+        pause_completion: Some(completion),
+        ..FakeSession::new(PlaybackState::Playing)
+    });
+    let backend = FakeBackend(Mutex::new(Ok(vec![session.clone()])));
+    let current = AtomicU64::new(1);
+    let mut leases = pause_sessions(&backend, &current, 1);
+    assert_eq!(leases.len(), 1);
+    leases[0].submitted = Instant::now() - ACK_DEADLINE;
+    leases[0].retiring = true;
+    assert!(!leases[0].progress());
+    assert!(leases[0].quarantined);
+    assert!(leases[0].pause.is_some());
+    assert!(session.observer.lock().unwrap().upgrade().is_some());
+    assert_eq!(session.plays(), 0);
+}
+
+#[test]
+fn pending_play_finishes_before_replacement_recording_can_pause() {
+    let completion = Arc::new(Mutex::new(None));
+    let session = Arc::new(FakeSession {
+        play_completion: Some(completion.clone()),
+        ..FakeSession::new(PlaybackState::Playing)
+    });
+    let (c, _) = controller(std::slice::from_ref(&session));
+    start(&c, 1);
+    stop(&c);
+    start(&c, 2);
+    assert_eq!((session.pauses(), session.plays()), (1, 1));
+    *completion.lock().unwrap() = Some(Ok(true));
+    c.flush();
+    assert_eq!((session.pauses(), session.plays()), (2, 1));
+    *completion.lock().unwrap() = Some(Ok(true));
+    stop(&c);
+}
+
+#[test]
+fn accepted_play_with_late_state_blocks_replacement_pause_until_acknowledged() {
+    let session = Arc::new(FakeSession {
+        defer_play_state: true,
+        ..FakeSession::new(PlaybackState::Playing)
+    });
+    let (c, _) = controller(std::slice::from_ref(&session));
+    start(&c, 1);
+    stop(&c);
+    start(&c, 2);
+    assert_eq!((session.pauses(), session.plays()), (1, 1));
+    assert_eq!(session.state(), Ok(PlaybackState::Paused));
+    session.change(Ok(PlaybackState::Playing));
+    c.flush();
+    assert_eq!((session.pauses(), session.plays()), (2, 1));
+    stop(&c);
+    session.change(Ok(PlaybackState::Playing));
+    c.flush();
+}
+
+#[test]
+fn unknown_play_reply_after_observed_play_stays_quarantined() {
+    let session = Arc::new(FakeSession {
+        play_completion: Some(Arc::new(Mutex::new(None))),
+        ..FakeSession::new(PlaybackState::Playing)
+    });
+    let (c, _) = controller(std::slice::from_ref(&session));
+    start(&c, 1);
+    stop(&c);
+    start(&c, 2);
+    assert_eq!((session.pauses(), session.plays()), (1, 1));
+    assert_eq!(session.state(), Ok(PlaybackState::Playing));
+    session.live.store(false, Ordering::SeqCst);
+    stop(&c);
+}
+
+#[test]
+fn observed_user_override_is_respected_while_pause_completion_is_pending() {
+    let completion = Arc::new(Mutex::new(None));
+    let session = Arc::new(FakeSession {
+        pause_completion: Some(completion.clone()),
+        ..FakeSession::new(PlaybackState::Playing)
+    });
+    let (c, _) = controller(std::slice::from_ref(&session));
+    start(&c, 1);
+    session.change(Ok(PlaybackState::Playing));
+    session.change(Ok(PlaybackState::Paused));
+    stop(&c);
+    *completion.lock().unwrap() = Some(Ok(true));
+    c.flush();
+    assert_eq!(session.plays(), 0);
+    assert_eq!(session.state(), Ok(PlaybackState::Paused));
+}
+
+#[test]
+fn lease_cap_refuses_a_partial_pause_batch() {
+    let sessions: Vec<_> = (0..MAX_MEDIA_LEASES + 3)
+        .map(|_| Arc::new(FakeSession::new(PlaybackState::Playing)))
+        .collect();
+    let (c, _) = controller(&sessions);
+    start(&c, 1);
+    stop(&c);
+    for session in sessions {
+        assert_eq!((session.pauses(), session.plays()), (0, 0));
+    }
+}
+
+#[test]
+fn unknown_pause_reply_after_observed_pause_stays_quarantined() {
+    let session = Arc::new(FakeSession {
+        pause_completion: Some(Arc::new(Mutex::new(None))),
+        ..FakeSession::new(PlaybackState::Playing)
+    });
+    let (c, _) = controller(std::slice::from_ref(&session));
+    start(&c, 1); // Playback changed, but the method result is unknown.
+    stop(&c);
+    start(&c, 2);
+    assert_eq!((session.pauses(), session.plays()), (1, 0));
+    assert_eq!(session.state(), Ok(PlaybackState::Paused));
+    session.live.store(false, Ordering::SeqCst);
+    stop(&c);
+}
+
+#[test]
+fn full_command_queue_cannot_prevent_stop_invalidation() {
+    let session = Arc::new(FakeSession::new(PlaybackState::Playing));
+    let (c, _) = controller(std::slice::from_ref(&session));
+    start(&c, 1);
+    let (entered, waiting) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    c.0.commands.send(Command::Park(entered, released)).unwrap();
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    for _ in 0..COMMAND_CAPACITY * 2 {
+        c.apply(1, true, true); // These calls must not wait for queue capacity.
+    }
+    c.remove(); // Even if End is dropped, the atomic generation invalidates it.
+    release.send(()).unwrap();
+    c.flush();
+    assert_eq!((session.pauses(), session.plays()), (1, 1));
 }

@@ -1,4 +1,4 @@
-//! Compiles and tests the actual production module on Windows without requiring
+//! Compiles and tests the actual production module without requiring
 //! unrelated speech-model/GPU SDKs. The application build remains a separate gate.
 #![cfg(test)]
 
