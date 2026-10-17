@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
-import en from "../src/i18n/locales/en/translation.json";
-import ru from "../src/i18n/locales/ru/translation.json";
+import en from "../src/i18n/locales/en/translation.json" with { type: "json" };
+import ru from "../src/i18n/locales/ru/translation.json" with { type: "json" };
 import type {} from "./fixtures/media-pause-consent";
 
 for (const [language, strings] of Object.entries({ en, ru })) {
@@ -8,7 +8,9 @@ for (const [language, strings] of Object.entries({ en, ru })) {
     page,
   }) => {
     const text = strings.settings.debug.pauseMediaWhileRecording;
-    await page.goto(`/tests/fixtures/media-pause-consent.html?lang=${language}`);
+    await page.goto(
+      `/tests/fixtures/media-pause-consent.html?lang=${language}`,
+    );
     const snapshot = () =>
       page.evaluate(() => window.mediaPauseConsentFixture.snapshot());
     const toggle = page.getByRole("checkbox");

@@ -17,7 +17,8 @@ window.__TAURI_OS_PLUGIN_INTERNALS__ = {
   exe_extension: "",
 };
 
-const language = new URLSearchParams(window.location.search).get("lang") || "en";
+const language =
+  new URLSearchParams(window.location.search).get("lang") || "en";
 let persisted = false;
 let persistedTheme = "system";
 const requested: boolean[] = [];
@@ -61,7 +62,9 @@ const controls = {
     requested: [...requested],
     pending: pending.length,
     unexpected: [...unexpected],
-    setting: useSettingsStore.getState().getSetting("pause_media_while_recording"),
+    setting: useSettingsStore
+      .getState()
+      .getSetting("pause_media_while_recording"),
     theme: useSettingsStore.getState().getSetting("theme"),
     persistedTheme,
   }),

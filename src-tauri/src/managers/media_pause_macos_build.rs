@@ -13,13 +13,48 @@ pub fn build(source: &std::path::Path, testing: bool) {
     let object = output.join("media_pause_macos.o");
     let archive = output.join("libhandy_quicktime.a");
     let mut clang = Command::new("xcrun");
-    clang.args(["--sdk", "macosx", "clang", "-arch", arch, "-fobjc-arc", "-fblocks", "-Wall", "-Wextra", "-Werror"]);
-    clang.arg(if arch == "arm64" { "-mmacosx-version-min=11.0" } else { "-mmacosx-version-min=10.15" }).arg("-c");
+    clang.args([
+        "--sdk",
+        "macosx",
+        "clang",
+        "-arch",
+        arch,
+        "-fobjc-arc",
+        "-fblocks",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ]);
+    clang
+        .arg(if arch == "arm64" {
+            "-mmacosx-version-min=11.0"
+        } else {
+            "-mmacosx-version-min=10.15"
+        })
+        .arg("-c");
     if testing {
         clang.arg("-DHANDY_QUICKTIME_FIXTURE=1");
     }
-    assert!(clang.arg(source).arg("-o").arg(&object).status().expect("Run clang").success(), "QuickTime shim compilation failed");
-    assert!(Command::new("xcrun").args(["libtool", "-static", "-o"]).arg(&archive).arg(&object).status().expect("Run libtool").success(), "QuickTime shim archive failed");
+    assert!(
+        clang
+            .arg(source)
+            .arg("-o")
+            .arg(&object)
+            .status()
+            .expect("Run clang")
+            .success(),
+        "QuickTime shim compilation failed"
+    );
+    assert!(
+        Command::new("xcrun")
+            .args(["libtool", "-static", "-o"])
+            .arg(&archive)
+            .arg(&object)
+            .status()
+            .expect("Run libtool")
+            .success(),
+        "QuickTime shim archive failed"
+    );
     println!("cargo:rerun-if-changed={}", source.display());
     println!("cargo:rustc-link-search=native={}", output.display());
     println!("cargo:rustc-link-lib=static=handy_quicktime");

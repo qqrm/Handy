@@ -1273,7 +1273,9 @@ pub async fn change_pause_media_while_recording_setting(
                 .await
                 .map_err(|error| format!("QuickTime permission task failed: {error}"))??;
         if !allowed {
-            return Err("QuickTime must be running and Automation permission must be granted".into());
+            return Err(
+                "QuickTime must be running and Automation permission must be granted".into(),
+            );
         }
     }
     let mut settings = settings::get_settings(&app);
