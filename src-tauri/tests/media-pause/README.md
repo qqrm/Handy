@@ -52,7 +52,7 @@ automatic resume ownership, including a rapid observed Play then Pause. Media
 APIs do not identify command authors: a repeated Pause while already paused can
 emit no transition, and suppressed/coalesced events cannot be reconstructed.
 Windows synchronous COM calls are not made cancellable by asynchronous polling.
-Linux read/setup deadlines are per call, not a hard whole-batch time limit.
+Linux and macOS read/setup deadlines are per call, not a hard whole-batch limit.
 
 ## Native fixtures
 
@@ -105,6 +105,8 @@ accepted policy preserves automatic resume with these limits; it does not
 promise perfect detection of user intent. Apple Event timeouts do not prove
 that a submitted command was cancelled, so uncertain operations are retained
 without retries and can suppress later pauses until the original player exits.
+The shared controller is the sole QuickTime state poller; its watch guard binds
+ownership for command preflight rather than starting a competing observer.
 
 The separate **Fork artifact packaging** workflow builds test packages without
 release credentials, publication, or retained installers. Both macOS targets
