@@ -11,8 +11,13 @@
 #import <stdatomic.h>
 static _Atomic int fixtureStopPID = 0;
 static _Atomic int fixtureCommands = 0;
+// Written by the explicit permission call, read only after that call returns.
+static NSDictionary *fixturePermissionDiagnostics;
 void handy_qt_fixture_stop_before_command(int pid) { atomic_store(&fixtureStopPID, pid); }
 int handy_qt_fixture_command_count(void) { return atomic_load(&fixtureCommands); }
+void *handy_qt_fixture_permission_diagnostics(void) {
+    @autoreleasepool { return (void *)CFBridgingRetain(fixturePermissionDiagnostics ?: @{}); }
+}
 #endif
 
 // Codes from the installed QuickTime public dictionary, asserted by native CI.
@@ -37,6 +42,9 @@ static const NSTimeInterval CommandDeadline = 1.0;
 
 static void qtRequire(BOOL valid) {
     if (!valid) @throw [NSException exceptionWithName:@"QuickTimeUnavailable" reason:nil userInfo:nil];
+}
+static void qtRequireIdentity(BOOL valid, NSString *reason) {
+    if (!valid) @throw [NSException exceptionWithName:@"QuickTimeIdentityUnavailable" reason:reason userInfo:nil];
 }
 // NSRunningApplication's cached terminated flag alone is insufficient on a
 // worker without an AppKit run loop. The kernel start timestamp fences PID reuse.
@@ -129,19 +137,41 @@ static int qtSnapshot(HandyQuickTimeTarget *item, double *position) {
     return playing.booleanValue ? 1 : 0;
 }
 static HandyQuickTimeTarget *qtProcessTarget(NSRunningApplication *app) {
-    qtRequire(app && !app.terminated && app.launchDate &&
-        [app.bundleIdentifier isEqualToString:@"com.apple.QuickTimePlayerX"]);
-    struct proc_bsdinfo info = {0};
-    qtRequire(proc_pidinfo(app.processIdentifier, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) == (int)sizeof(info));
+    pid_t pid = app.processIdentifier;
+    NSDate *launch = app.launchDate;
+    NSURL *executable = app.executableURL.URLByResolvingSymlinksInPath.URLByStandardizingPath;
+    qtRequireIdentity(app && !app.terminated && pid > 0 && launch && executable.isFileURL &&
+        [app.bundleIdentifier isEqualToString:@"com.apple.QuickTimePlayerX"], @"initial Cocoa identity unavailable");
+    struct proc_bsdinfo before = {0};
+    qtRequireIdentity(proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &before, sizeof(before)) == (int)sizeof(before),
+        @"kernel identity before discovery unavailable");
+    char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+    int length = proc_pidpath(pid, path, sizeof(path));
+    qtRequireIdentity(length > 0 && length < (int)sizeof(path), @"kernel executable path unavailable");
+    NSString *pathString = [[NSString alloc] initWithBytes:path length:(NSUInteger)length encoding:NSUTF8StringEncoding];
+    qtRequireIdentity(pathString != nil, @"kernel executable path is not UTF-8");
+    NSURL *kernelExecutable = [NSURL fileURLWithPath:pathString].URLByResolvingSymlinksInPath.URLByStandardizingPath;
+    qtRequireIdentity([kernelExecutable isEqual:executable], @"kernel and Cocoa executable paths differ");
+    NSRunningApplication *fresh = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+    qtRequireIdentity(fresh && !fresh.terminated && [fresh isEqual:app] &&
+        [fresh.bundleIdentifier isEqualToString:@"com.apple.QuickTimePlayerX"] &&
+        [fresh.launchDate isEqualToDate:launch] &&
+        [fresh.executableURL.URLByResolvingSymlinksInPath.URLByStandardizingPath isEqual:executable],
+        @"Cocoa process identity changed during discovery");
+    struct proc_bsdinfo after = {0};
+    qtRequireIdentity(proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &after, sizeof(after)) == (int)sizeof(after),
+        @"kernel identity after discovery unavailable");
+    qtRequireIdentity(before.pbi_start_tvsec == after.pbi_start_tvsec &&
+        before.pbi_start_tvusec == after.pbi_start_tvusec, @"kernel process generation changed during discovery");
     HandyQuickTimeTarget *item = [HandyQuickTimeTarget new];
-    item.pid = app.processIdentifier;
-    item.startSeconds = info.pbi_start_tvsec;
-    item.startMicros = info.pbi_start_tvusec;
-    item.launchDate = app.launchDate;
-    // Fence discovery racing a restart: Cocoa and kernel timestamps must agree.
-    double kernelStart = item.startSeconds + item.startMicros / 1000000.0;
-    qtRequire(fabs(item.launchDate.timeIntervalSince1970 - kernelStart) < 0.01);
+    item.pid = pid;
+    item.startSeconds = before.pbi_start_tvsec;
+    item.startMicros = before.pbi_start_tvusec;
+    item.launchDate = launch;
+    // Compare each identity source with itself: Cocoa launchDate and the
+    // kernel's process-start timestamp have no documented cross-clock equality.
     item.address = [NSAppleEventDescriptor descriptorWithProcessIdentifier:item.pid];
+    qtRequireIdentity(item.address && qtProcess(item) == 1, @"process changed before address capture");
     return item;
 }
 // Ownership of every nonnull pointer crosses the C ABI at +1 and has one release.
@@ -164,6 +194,8 @@ void *handy_qt_discover(size_t *count, int *status) {
                     // Non-document windows are excluded; never target by index/name.
                     @try {
                         HandyQuickTimeTarget *item = qtProcessTarget(app);
+                        qtRequire(item.pid == process.pid && item.startSeconds == process.startSeconds &&
+                            item.startMicros == process.startMicros);
                         NSAppleEventDescriptor *window = [windows descriptorAtIndex:index];
                         item.windowID = qtWindowID(item, window);
                         qtRequire([qtInteger(qtProperty(item, window, 'ID  ')).data isEqual:item.windowID.data]);
@@ -224,12 +256,31 @@ int handy_qt_command(void *raw, int play, bool (*allowed)(void *, double), void 
 }
 int handy_qt_request_permission(void) {
     @autoreleasepool {
+        NSString *stage = @"application_discovery";
         @try {
             NSArray *apps = [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.QuickTimePlayerX"];
+#ifdef HANDY_QUICKTIME_FIXTURE
+            fixturePermissionDiagnostics = @{@"stage": stage, @"candidate_count": @(apps.count)};
+#endif
             if (apps.count != 1) return 0;
+            stage = @"process_identity";
             HandyQuickTimeTarget *item = qtProcessTarget(apps.firstObject);
+            stage = @"automation_permission";
             OSStatus result = AEDeterminePermissionToAutomateTarget(item.address.aeDesc, typeWildCard, typeWildCard, true);
-            return result == noErr && qtProcess(item) == 1 ? 1 : -1;
-        } @catch (__unused NSException *error) { return -1; }
+            int live = qtProcess(item);
+#ifdef HANDY_QUICKTIME_FIXTURE
+            fixturePermissionDiagnostics = @{@"stage": stage, @"apple_event_status": @(result), @"original_process_live": @(live)};
+#endif
+            if (result != noErr || live != 1)
+                NSLog(@"QuickTime Automation permission status=%d original_process_live=%d", (int)result, live);
+            return result == noErr && live == 1 ? 1 : -1;
+        } @catch (NSException *error) {
+#ifdef HANDY_QUICKTIME_FIXTURE
+            fixturePermissionDiagnostics = @{@"stage": stage, @"exception": error.name,
+                @"reason": error.reason ?: @"unspecified native precondition"};
+#endif
+            NSLog(@"QuickTime permission failed at %@: %@", stage, error.reason ?: error.name);
+            return -1;
+        }
     }
 }

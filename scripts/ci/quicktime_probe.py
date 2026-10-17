@@ -44,6 +44,7 @@ extern void handy_fixture_end(void *);
 extern void handy_fixture_destroy(void *);
 extern void handy_qt_fixture_stop_before_command(int);
 extern int handy_qt_fixture_command_count(void);
+extern void *handy_qt_fixture_permission_diagnostics(void);
 
 static NSDictionary *cfg;
 static NSMutableDictionary *report;
@@ -249,12 +250,33 @@ static void waitState(ProbeTarget *doc, BOOL expected) {
 }
 static double assertAdvancing(ProbeTarget *doc, NSString *name) {
     waitState(doc, YES);
+    double began = NSProcessInfo.processInfo.systemUptime;
     double before = position(doc);
-    [NSThread sleepForTimeInterval:1.25];
-    double after = position(doc);
-    probeRequire(playing(doc) && after - before >= 0.35 && after - before < 5.0,
-        [NSString stringWithFormat:@"%@: playback did not advance plausibly (%f -> %f)", name, before, after]);
-    recordCheck(name, @{@"before_seconds": @(before), @"after_seconds": @(after)});
+    probeRequire(before >= 0, @"Playback position is negative");
+    double after = before, previous = before, elapsed = 0;
+    NSUInteger samples = 0;
+    do {
+        [NSThread sleepForTimeInterval:0.1];
+        after = position(doc);
+        BOOL isPlaying = playing(doc);
+        elapsed = NSProcessInfo.processInfo.systemUptime - began;
+        ++samples;
+        double delta = after - before;
+        probeRequire(isPlaying && after >= previous && delta < 6.0 && delta <= 2.0 * elapsed + 0.25,
+            [NSString stringWithFormat:@"%@: playback stopped, reversed, or jumped (%f -> %f in %fs)",
+                name, before, after, elapsed]);
+        // Startup after seeking may stall briefly. Require real clock progress
+        // within a bounded deadline, not a particular instantaneous play rate.
+        // Keep it observable for multiple controller polls in override cases.
+        if (delta >= 0.35 && elapsed >= 0.75 && elapsed <= 5.0) {
+            recordCheck(name, @{@"before_seconds": @(before), @"after_seconds": @(after),
+                @"elapsed_seconds": @(elapsed), @"samples": @(samples)});
+            return after;
+        }
+        previous = after;
+    } while (elapsed < 5.0);
+    probeRequire(NO, [NSString stringWithFormat:@"%@: playback did not advance by 0.35s within 5s (%f -> %f)",
+        name, before, after]);
     return after;
 }
 static double assertPaused(ProbeTarget *doc, NSString *name) {
@@ -310,6 +332,7 @@ static void runProbe(void) {
     // that asking during recording is acceptable from this fixture.
     int consent = handy_fixture_permission(); // Exact production settings function.
     report[@"consent_status"] = @(consent);
+    report[@"consent_native_diagnostics"] = CFBridgingRelease(handy_qt_fixture_permission_diagnostics());
     probeRequire(consent == 1, [NSString stringWithFormat:@"QuickTime TCC consent unavailable: %d", consent]);
     probeRequire(AEDeterminePermissionToAutomateTarget(target.aeDesc,
         typeWildCard, typeWildCard, false) == noErr, @"Consent not retained");
