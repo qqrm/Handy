@@ -527,7 +527,8 @@ jobs:
           "$tools_dir/linuxdeploy-${arch}.AppImage" --appimage-extract-and-run --version
 
       - name: Build with Tauri
-        uses: tauri-apps/tauri-action@v0
+        if: "!inputs.artifact-only"
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_ID: ${{ inputs.sign-binaries && secrets.APPLE_ID || '' }}
@@ -558,6 +559,100 @@ jobs:
           releaseId: ${{ inputs.release-id }}
           assetNamePattern: ${{ steps.patch-release-name.outputs.platform }}
           args: ${{ inputs.build-args }} ${{ steps.build-policy.outputs.config-args }}
+
+      # Empty APPLE_CERTIFICATE still asks Tauri to import a certificate. Test
+      # builds must omit signing credentials entirely; macOS keeps the tracked
+      # ad-hoc identity (-), without Developer ID signing or notarization.
+      - name: Build isolated test packages without signing credentials
+        if: inputs.artifact-only
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
+        env:
+          LINUXDEPLOY_EXCLUDED_LIBRARIES: ${{ contains(inputs.platform, 'ubuntu') && 'libvulkan.so*;libwayland-client.so*' || '' }}
+          LINUXDEPLOY_OUTPUT_VERSION: ${{ contains(inputs.platform, 'ubuntu') && steps.get-version.outputs.version || '' }}
+        with:
+          assetNamePattern: ${{ steps.patch-release-name.outputs.platform }}
+          args: ${{ inputs.build-args }} ${{ steps.build-policy.outputs.config-args }}
+
+      - name: Verify ad-hoc macOS test package and executable
+        if: inputs.artifact-only && contains(inputs.platform, 'macos')
+        shell: bash
+        env:
+          HANDY_BUILD_TARGET: ${{ inputs.target }}
+          HANDY_BUILD_PROFILE: ${{ steps.build-profile.outputs.profile }}
+        run: |
+          set -euo pipefail
+          base="src-tauri/target/${HANDY_BUILD_TARGET}/${HANDY_BUILD_PROFILE}/bundle"
+          app="$base/macos/Handy.app"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$app/Contents/Info.plist")
+          binary="$app/Contents/MacOS/$executable"
+          case "$HANDY_BUILD_TARGET" in
+            aarch64-apple-darwin) expected_arch=arm64 ;;
+            x86_64-apple-darwin) expected_arch=x86_64 ;;
+            *) echo 'Unsupported macOS test target' >&2; exit 1 ;;
+          esac
+          test "$(lipo -archs "$binary")" = "$expected_arch"
+          codesign --verify --deep --strict "$app"
+          signature=$(codesign -dv "$app" 2>&1)
+          printf '%s\n' "$signature"
+          printf '%s\n' "$signature" | grep -q 'Signature=adhoc'
+          test -n "$(/usr/libexec/PlistBuddy -c 'Print NSAppleEventsUsageDescription' "$app/Contents/Info.plist")"
+          codesign -d --entitlements :- "$app" > "$RUNNER_TEMP/handy-package-entitlements.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print com.apple.security.automation.apple-events' "$RUNNER_TEMP/handy-package-entitlements.plist")" = true
+          test -z "$(find "$base" -name '*.sig' -print -quit)"
+          python3 - "$binary" <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          import time
+          environment = {**os.environ, "RUST_LOG": "info"}
+          expected_devices = None
+          # A fresh hosted ARM VM took 31.450s compiling Metal libraries, then
+          # completed enumeration. Allow cold shader compilation explicitly;
+          # require the repeat launch to satisfy the original short deadline.
+          checks = (("help", "--help", 30), ("cold", "--list-devices", 120), ("warm", "--list-devices", 30))
+          for phase, argument, deadline in checks:
+              print(f"Checking packaged executable {argument} ({phase}, limit={deadline}s)", flush=True)
+              started = time.monotonic()
+              process = subprocess.Popen([sys.argv[1], argument], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment)
+              try:
+                  stdout, stderr = process.communicate(timeout=deadline)
+              except subprocess.TimeoutExpired:
+                  # Inspect only this job's own disposable test process. Keep
+                  # the failed runtime gate; a built/signed package is not proof
+                  # that the application initializes and exits successfully.
+                  sample = Path(os.environ["RUNNER_TEMP"]) / f"handy-startup-{phase}-sample.txt"
+                  try:
+                      diagnostic = subprocess.run(["/usr/bin/sample", str(process.pid), "3", "-file", str(sample)], timeout=10, capture_output=True, text=True)
+                      print(diagnostic.stdout, diagnostic.stderr, flush=True)
+                      if sample.exists():
+                          print(sample.read_text(errors="replace")[:60000], flush=True)
+                  finally:
+                      process.kill()
+                      stdout, stderr = process.communicate(timeout=5)
+                      print(stdout, stderr, flush=True)
+                  raise
+              print(stdout, stderr, flush=True)
+              print(f"Packaged executable {phase}: {time.monotonic() - started:.3f}s, exit={process.returncode}", flush=True)
+              if process.returncode != 0:
+                  raise SystemExit(f"Packaged executable failed {argument}: exit {process.returncode}")
+              if argument == "--help" and not all(expected in stdout for expected in ("Usage:", "--list-devices")):
+                  raise SystemExit("Packaged executable did not return the expected CLI help")
+              if argument == "--list-devices":
+                  entries = [line.strip() for line in stdout.splitlines() if line.strip().startswith("index=")]
+                  matches = [re.fullmatch(r"index=(\S+) kind=(\S+) name=(.+) vram=\d+MB", entry) for entry in entries]
+                  if not entries or any(match is None for match in matches):
+                      raise SystemExit("Packaged executable returned invalid compute-device entries")
+                  # Available/advisory memory may change; identity must not.
+                  devices = [match.groups() for match in matches]
+                  if "transcribe-cpp compute devices:" not in stdout or not any(device[1] == "cpu" for device in devices):
+                      raise SystemExit("Packaged executable did not enumerate its CPU backend")
+                  if expected_devices is not None and devices != expected_devices:
+                      raise SystemExit("Cold and warm launches enumerated different compute devices")
+                  expected_devices = devices
+          print("Verified packaged macOS executable starts without signing credentials.")
+          PY
 
       # tauri-action uploads release assets before returning. All AppImage
       # filtering therefore happens inside linuxdeploy above; this verifies the

@@ -17,7 +17,8 @@ import { ModelSettingsCard } from "./ModelSettingsCard";
 export const GeneralSettings: React.FC = () => {
   const { t } = useTranslation();
   const { audioFeedbackEnabled } = useSettings();
-  const isLinux = type() === "linux";
+  const platform = type();
+  const isLinux = platform === "linux";
   return (
     <div className="max-w-3xl w-full mx-auto space-y-6">
       <SettingsGroup title={t("settings.general.title")}>
@@ -31,7 +32,7 @@ export const GeneralSettings: React.FC = () => {
         <MicrophoneSelector descriptionMode="tooltip" grouped={true} />
         <ChannelSelector descriptionMode="tooltip" grouped={true} />
         <MuteWhileRecording descriptionMode="tooltip" grouped={true} />
-        {type() === "windows" && (
+        {(platform === "windows" || isLinux || platform === "macos") && (
           <PauseMediaWhileRecording descriptionMode="tooltip" grouped={true} />
         )}
         <AudioFeedback descriptionMode="tooltip" grouped={true} />

@@ -1,6 +1,8 @@
 import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 import { listen } from "@tauri-apps/api/event";
+import { type } from "@tauri-apps/plugin-os";
+import i18n from "i18next";
 import type {
   AppSettings as Settings,
   AudioDevice,
@@ -160,8 +162,21 @@ const settingUpdaters: {
     commands.setPostProcessSelectedPrompt(value as string),
   mute_while_recording: (value) =>
     commands.changeMuteWhileRecordingSetting(value as boolean),
-  pause_media_while_recording: (value) =>
-    commands.changePauseMediaWhileRecordingSetting(value as boolean),
+  pause_media_while_recording: async (value) => {
+    const result = await commands.changePauseMediaWhileRecordingSetting(
+      value as boolean,
+    );
+    if (result.status === "error") {
+      toast.error(
+        type() === "macos" && value
+          ? i18n.t(
+              "settings.debug.pauseMediaWhileRecording.macosPermissionError",
+            )
+          : result.error,
+      );
+      throw new Error(result.error);
+    }
+  },
   append_trailing_space: (value) =>
     commands.changeAppendTrailingSpaceSetting(value as boolean),
   log_level: (value) => commands.setLogLevel(value as any),
@@ -336,7 +351,11 @@ export const useSettingsStore = create<SettingsStore>()(
       } catch (error) {
         console.error(`Failed to update setting ${String(key)}:`, error);
         if (settings) {
-          set({ settings: { ...settings, [key]: originalValue } });
+          set((state) => ({
+            settings: state.settings
+              ? { ...state.settings, [key]: originalValue }
+              : null,
+          }));
         }
       } finally {
         setUpdating(updateKey, false);

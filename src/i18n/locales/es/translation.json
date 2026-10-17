@@ -537,7 +537,9 @@
       },
       "pauseMediaWhileRecording": {
         "label": "Pause Media While Recording",
-        "description": "Pause currently playing media during recording and resume it afterwards"
+        "description": "Pause currently playing media during recording and resume it afterwards",
+        "macosDescription": "QuickTime Player local files only. Open it, then enable this setting and allow Automation. Pauses during recording and attempts to resume afterwards. Observed manual playback changes cancel automatic resume.",
+        "macosPermissionError": "Open QuickTime Player, allow Handy to control it in System Settings → Privacy & Security → Automation, then enable this setting again."
       },
       "appendTrailingSpace": {
         "label": "Agregar espacio final",

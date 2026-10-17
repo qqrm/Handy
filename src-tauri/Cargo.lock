@@ -2536,6 +2536,7 @@ dependencies = [
  "whatlang",
  "windows 0.61.3",
  "winreg 0.55.0",
+ "zbus",
 ]
 
 [[package]]

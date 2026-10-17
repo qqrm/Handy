@@ -1,8 +1,8 @@
 name: "Main Branch Build"
 
 # Runs the full cross-platform build on every push to main so breakage is
-# caught before a manual release is triggered. Artifacts are kept for 30 days
-# so any commit on main has a downloadable, testable build.
+# caught before a manual release is triggered. Upstream retains installers;
+# this fork validates them without consuming retained artifact storage.
 
 on:
   push:
@@ -47,7 +47,7 @@ jobs:
       platform: ${{ matrix.platform }}
       target: ${{ matrix.target }}
       build-args: ${{ matrix.args }}
-      upload-artifacts: true
+      upload-artifacts: ${{ github.repository == 'cjpais/Handy' }}
       sign-binaries: ${{ github.repository == 'cjpais/Handy' }}
       artifact-only: ${{ github.repository != 'cjpais/Handy' }}
     secrets: inherit

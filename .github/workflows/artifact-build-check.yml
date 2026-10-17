@@ -34,3 +34,20 @@ jobs:
       sign-binaries: false
       upload-artifacts: false
       asset-prefix: handy-pr
+
+  macos-artifact:
+    needs: build-policy
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    uses: ./.github/workflows/build.yml
+    with:
+      # Build both targets on ARM to catch host/target confusion in build.rs.
+      platform: macos-26
+      target: ${{ matrix.target }}
+      build-args: --target ${{ matrix.target }}
+      artifact-only: true
+      sign-binaries: false
+      upload-artifacts: false
+      asset-prefix: handy-pr

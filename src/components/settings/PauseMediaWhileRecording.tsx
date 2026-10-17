@@ -1,5 +1,6 @@
 import React from "react";
 import { useTranslation } from "react-i18next";
+import { type } from "@tauri-apps/plugin-os";
 import { ToggleSwitch } from "../ui/ToggleSwitch";
 import { useSettings } from "../../hooks/useSettings";
 
@@ -23,7 +24,11 @@ export const PauseMediaWhileRecording: React.FC<PauseMediaWhileRecordingTogglePr
         }
         isUpdating={isUpdating("pause_media_while_recording")}
         label={t("settings.debug.pauseMediaWhileRecording.label")}
-        description={t("settings.debug.pauseMediaWhileRecording.description")}
+        description={t(
+          type() === "macos"
+            ? "settings.debug.pauseMediaWhileRecording.macosDescription"
+            : "settings.debug.pauseMediaWhileRecording.description",
+        )}
         descriptionMode={descriptionMode}
         grouped={grouped}
       />

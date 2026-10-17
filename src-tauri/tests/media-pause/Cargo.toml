@@ -6,9 +6,18 @@ publish = false
 
 [lib]
 path = "lib.rs"
+crate-type = ["rlib", "staticlib"]
+
+[features]
+quicktime-fixture = []
 
 [dependencies]
 log = "0.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "=5.13.2"
+tokio = { version = "1.43.0", features = ["rt-multi-thread", "time", "sync", "macros"] }
+futures-util = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "=0.61.3", features = ["Media_Control", "Foundation", "Win32_System_WinRT"] }
