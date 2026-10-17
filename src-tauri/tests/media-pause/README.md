@@ -1,7 +1,7 @@
 # Media pause validation
 
-The small test crate compiles the **production** controller and its Windows SMTC
-or Linux MPRIS adapter, without speech-model/GPU SDKs. Full application builds
+The small test crate compiles the **production** controller and its Windows SMTC,
+Linux MPRIS, or macOS QuickTime adapter, without speech-model/GPU SDKs. Full application builds
 remain separate checks. All builds and runtime tests for this change run on
 standard GitHub-hosted VMs in this public fork. Never run the native player
 fixtures on a working desktop or spoof their hosted-environment guards.
@@ -16,19 +16,20 @@ fixtures on a working desktop or spoof their hosted-environment guards.
   D-Bus; advancing/paused clocks, initially paused player, multiple players,
   user override, replacement owner, and delayed-reply regression. Excludes
   audible hardware (dummy sink), every desktop/browser, and transcription.
-- **macOS Intel:** shared controller regressions, actual QuickTime public Apple
-  Events feasibility probe, application packaging and executable startup.
-  Excludes a production macOS media adapter, other players, and transcription.
-- **macOS Apple Silicon:** same controller/probe on native ARM, native packaging
-  and executable startup. Same exclusions as Intel; building is not playback
-  validation.
+- **macOS Intel:** production controller and QuickTime adapter regressions and
+  actual playback through public Apple Events on a native Intel VM. Application
+  packaging and executable startup also run, with the x64 package built on ARM
+  and launched under Rosetta. Excludes other players and transcription.
+- **macOS Apple Silicon:** the same controller/adapter and real QuickTime fixture
+  on native ARM, native packaging and executable startup. Same exclusions as
+  Intel; building alone is not playback validation.
 
 This list describes the required checks, **not their current pass status**.
 Inspect the exact PR commit's Checks tab. A failed or unavailable native fixture
 is a coverage gap; do not skip it or replace it with mocks and report success.
-The macOS fixture is deliberately labelled a transport experiment: it does not
-call a Handy macOS backend. The setting remains available only on Windows/Linux
-until a macOS policy and its production implementation are validated.
+The opt-in setting is available on Windows, Linux and macOS, and remains off by
+default. macOS support is explicitly limited to QuickTime Player local files. A passing
+fixture does not extend that support to Music, Spotify, VLC, or browsers.
 
 ## Controller behavior
 
@@ -74,16 +75,36 @@ are controlled; PID and unique D-Bus-owner identity are checked. A separate
 protocol service tests delayed replies and signal ordering. The product adapter
 uses zbus directly and requires neither VLC nor playerctl.
 
-The macOS experiment uses only public PID-addressed Apple Events, launch identity,
-and a frozen QuickTime window ID with an unchanged file association. QuickTime
-returns documents by name, which is not a stable playback identity. The probe
-instead targets the document property of the original window and rejects a
-closed/reopened window. Same-file replacement inside a surviving window remains
-unobservable; this is not a universal media-session token. It measures actual
-position movement and checks a second/non-first document is not retargeted. It may
-accept only the exact probe-to-QuickTime consent dialog inside the fresh VM;
-it never modifies the TCC database or sends global media keys. Missing consent,
+The macOS adapter uses public PID-addressed Apple Events, launch identity, and
+the original QuickTime window ID with an unchanged file association. QuickTime
+returns documents by name, which is not a stable playback identity; playback
+commands instead address the document property of the original window. Closed
+or replaced windows are rejected. The fixture measures actual clock progression
+and tests the production adapter/controller, including multiple documents.
+Only the exact fixture-to-QuickTime consent dialog may be accepted inside the
+fresh VM; no TCC database changes or global media keys are used. Missing consent,
 a missing receipt, a timeout, or a non-advancing clock fails the check.
+
+### macOS automatic resume limits
+
+QuickTime Player local-file documents are supported in this version. Enabling the
+setting requests macOS Automation permission for an already running QuickTime;
+open QuickTime first, then enable the setting. Denial leaves the setting off and
+playback alone. There are no consent prompts during recording. The app contains
+Apple's required
+[usage description](https://developer.apple.com/documentation/bundleresources/information-property-list/nsappleeventsusagedescription)
+and [Apple Events entitlement](https://developer.apple.com/documentation/BundleResources/Entitlements/com.apple.security.automation.apple-events).
+It never launches a closed player or opens/reopens a media file.
+
+Automatic resume is best effort: an observed manual playback change, lost
+identity or read error revokes resume. Polling cannot detect a quick Play then
+Pause between reads, a repeated Pause in the same state, or every same-file
+replacement inside a surviving window. Process/window/file checks reduce
+retargeting risk but are not an atomic media-session generation token. The
+accepted policy preserves automatic resume with these limits; it does not
+promise perfect detection of user intent. Apple Event timeouts do not prove
+that a submitted command was cancelled, so uncertain operations are retained
+without retries and can suppress later pauses until the original player exits.
 
 The separate **Fork artifact packaging** workflow builds test packages without
 release credentials, publication, or retained installers. Both macOS targets
@@ -116,8 +137,8 @@ and preserve observed user overrides and late acknowledgements.
 #2054 explores public Apple Events for named macOS applications and opt-in
 browser JavaScript. Its Linux `dbus-send` fallback omits method-call mode, so a
 successful tool exit does not establish that Pause/Play was invoked. The fork
-uses direct typed D-Bus method calls. macOS generality remains an open product
-choice; the QuickTime probe is not a claim of parity with all its targets.
+uses direct typed D-Bus method calls. The macOS adapter supports only the checked
+QuickTime transport; it does not claim parity with all of #2054's targets.
 
 Public Apple Events alone do not make every player a suitable adapter. VLC's
 [reviewed macOS AppleScript `play` handler](https://github.com/videolan/vlc/blob/3.0.x/modules/gui/macosx/applescript.m)
@@ -128,7 +149,6 @@ their actual playback and current application dictionaries remain unvalidated.
 QuickTime is the only public macOS transport exercised by this change. Polling
 cannot reconstruct Play/Pause transitions between reads, and
 [distributed notifications](https://developer.apple.com/documentation/foundation/distributednotificationcenter)
-can be delayed or dropped. A future macOS backend therefore needs
-an explicit supported-player list and documented best-effort resume semantics;
-pause without automatic resume is the alternative when those limits are not
-acceptable. No adapter should reopen a saved track or launch a closed player.
+can be delayed or dropped. The explicit QuickTime-only scope and documented
+best-effort automatic resume are intentional; other players need their own
+identity, explicit-command and native-playback validation before support expands.

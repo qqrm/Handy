@@ -6,6 +6,10 @@ publish = false
 
 [lib]
 path = "lib.rs"
+crate-type = ["rlib", "staticlib"]
+
+[features]
+quicktime-fixture = []
 
 [dependencies]
 log = "0.4"

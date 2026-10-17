@@ -83,7 +83,7 @@ jobs:
           done
 
   macos-isolated-quicktime:
-    name: macOS public Apple Events probe (${{ matrix.platform }})
+    name: macOS production QuickTime (${{ matrix.platform }})
     strategy:
       fail-fast: false
       matrix:
@@ -94,18 +94,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Verify real QuickTime playback through public APIs
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable
+        with:
+          toolchain: stable
+      - name: Verify production adapter and real QuickTime playback
         env:
           HANDY_RUN_ISOLATED_QUICKTIME_TESTS: "1"
         run: python3 scripts/ci/quicktime_probe.py
-      - name: Show the bounded probe result
+      - name: Show the bounded native result
         if: always()
         shell: bash
         run: |
           if [ -f "$RUNNER_TEMP/quicktime-probe-result.json" ]; then
             cat "$RUNNER_TEMP/quicktime-probe-result.json"
           else
-            echo "No playback receipt: the probe did not reach runtime validation."
+            echo "No playback receipt: the fixture did not reach runtime validation."
           fi
 
   windows-isolated-smtc:

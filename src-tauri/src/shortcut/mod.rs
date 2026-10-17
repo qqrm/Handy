@@ -1260,10 +1260,22 @@ pub fn change_mute_while_recording_setting(app: AppHandle, enabled: bool) -> Res
 
 #[tauri::command]
 #[specta::specta]
-pub fn change_pause_media_while_recording_setting(
+pub async fn change_pause_media_while_recording_setting(
     app: AppHandle,
     enabled: bool,
 ) -> Result<(), String> {
+    // Consent is an explicit settings action, never a recording side effect.
+    // No settings/audio lock is held while macOS displays its permission dialog.
+    #[cfg(target_os = "macos")]
+    if enabled {
+        let allowed =
+            tauri::async_runtime::spawn_blocking(crate::managers::request_quicktime_permission)
+                .await
+                .map_err(|error| format!("QuickTime permission task failed: {error}"))??;
+        if !allowed {
+            return Err("QuickTime must be running and Automation permission must be granted".into());
+        }
+    }
     let mut settings = settings::get_settings(&app);
     settings.pause_media_while_recording = enabled;
     settings::write_settings(&app, settings);

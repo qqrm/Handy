@@ -24,6 +24,15 @@ mod platform;
 #[path = "media_pause_linux.rs"]
 mod platform;
 
+#[cfg(target_os = "macos")]
+#[path = "media_pause_macos.rs"]
+mod platform;
+
+#[cfg(target_os = "macos")]
+pub(crate) fn request_quicktime_permission() -> MediaResult<bool> {
+    platform::request_quicktime_permission()
+}
+
 /// Prevent accidental desktop execution; the hosted VM provides isolation.
 /// Environment values are a fail-closed launch check, not a security sandbox.
 #[cfg(all(test, windows))]
@@ -325,9 +334,9 @@ pub(super) struct MediaPauseController(Arc<Sender>);
 
 impl MediaPauseController {
     pub(super) fn new() -> Self {
-        #[cfg(any(windows, target_os = "linux"))]
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
         let backend = Arc::new(platform::Backend);
-        #[cfg(not(any(windows, target_os = "linux")))]
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
         let backend = Arc::new(NoMediaBackend);
         Self::with_backend(backend)
     }
@@ -513,9 +522,9 @@ impl MediaPauseController {
     }
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 struct NoMediaBackend;
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 impl MediaBackend for NoMediaBackend {
     fn sessions(&self) -> MediaResult<Vec<Arc<dyn MediaSession>>> {
         Ok(Vec::new())

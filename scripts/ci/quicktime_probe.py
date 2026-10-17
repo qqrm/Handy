@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hosted-only real QuickTime Apple Events diagnostic. Never a product backend.
+"""Hosted-only real QuickTime test of the production Rust controller and AE shim.
 
 Run on a fresh standard macos-15-intel or macos-26 GitHub VM:
   HANDY_RUN_ISOLATED_QUICKTIME_TESTS=1 python3 scripts/ci/quicktime_probe.py
@@ -35,6 +35,15 @@ NATIVE = r'''
 #import <CoreServices/CoreServices.h>
 #import <math.h>
 #import <unistd.h>
+#import <signal.h>
+
+extern int handy_fixture_permission(void);
+extern void *handy_fixture_new(void);
+extern void handy_fixture_begin(void *, uint64_t);
+extern void handy_fixture_end(void *);
+extern void handy_fixture_destroy(void *);
+extern void handy_qt_fixture_stop_before_command(int);
+extern int handy_qt_fixture_command_count(void);
 
 static NSDictionary *cfg;
 static NSMutableDictionary *report;
@@ -45,6 +54,7 @@ static NSAppleEventDescriptor *target;
 static NSString *receipt;
 static BOOL ownsPlayer = NO;
 static NSInteger playbackCommands = 0;
+static void *controller = NULL;
 
 @interface ProbeTarget : NSObject
 @property(nonatomic, strong) NSAppleEventDescriptor *window;
@@ -298,16 +308,23 @@ static void runProbe(void) {
 
     // This opt-in hosted diagnostic alone may ask. Production must not infer
     // that asking during recording is acceptable from this fixture.
-    OSStatus consent = AEDeterminePermissionToAutomateTarget(target.aeDesc,
-        typeWildCard, typeWildCard, true);
+    int consent = handy_fixture_permission(); // Exact production settings function.
     report[@"consent_status"] = @(consent);
-    probeRequire(consent == noErr, [NSString stringWithFormat:@"QuickTime TCC consent unavailable: %d", (int)consent]);
+    probeRequire(consent == 1, [NSString stringWithFormat:@"QuickTime TCC consent unavailable: %d", consent]);
     probeRequire(AEDeterminePermissionToAutomateTarget(target.aeDesc,
         typeWildCard, typeWildCard, false) == noErr, @"Consent not retained");
     report[@"phase"] = @"measuring_real_player";
     save();
 
     probeRequire(documents().numberOfItems == 0, @"Unexpected preexisting QuickTime documents");
+    controller = handy_fixture_new();
+    probeRequire(controller != NULL, @"Production controller refused isolated fixture");
+    int emptyCommands = handy_qt_fixture_command_count();
+    handy_fixture_begin(controller, 1);
+    [NSThread sleepForTimeInterval:1.0];
+    handy_fixture_end(controller);
+    probeRequire(handy_qt_fixture_command_count() == emptyCommands,
+        @"Production controller sent a command without media");
     probeRequire(playbackCommands == 0, @"No-media probe unexpectedly sent a playback command");
     recordCheck(@"no_media", @{@"documents": @0, @"play_or_pause_commands_sent": @(playbackCommands)});
     ProbeTarget *a = freeze([openFile(cfg[@"file_a"], 1) descriptorAtIndex:1]);
@@ -387,6 +404,106 @@ static void runProbe(void) {
     assertPaused(replacement, @"replacement_remains_paused");
     recordCheck(@"closed_window_target_rejected", @{@"old_window_id": savedID,
         @"replacement_id": identity(replacement), @"reason": rejection ?: @"unknown"});
+
+    // From this point all recording Pause/Resume operations use the actual Rust
+    // controller+adapter linked into this app. Direct Apple Events only establish
+    // independent fixture state, read clocks, or simulate a user override.
+    ProbeTarget *active = replacement;
+    ProbeTarget *untouched = first;
+    probeRequire(![identity(active) isEqualToString:identity(untouched)], @"Fixture identities overlap");
+    command(@"pause", untouched);
+    double untouchedBefore = position(untouched);
+    command(@"play", active);
+    assertAdvancing(active, @"production_setup_playing");
+    int before = handy_qt_fixture_command_count();
+    handy_fixture_begin(controller, 2);
+    assertPaused(active, @"production_recording_pauses_same_window");
+    probeRequire(handy_qt_fixture_command_count() == before + 1 && !playing(untouched),
+        @"Production pause did not target exactly the playing window");
+    handy_fixture_end(controller);
+    assertAdvancing(active, @"production_end_resumes_same_window");
+    probeRequire(handy_qt_fixture_command_count() == before + 2 && !playing(untouched) &&
+        fabs(position(untouched) - untouchedBefore) < 0.10, @"Production resume altered another document");
+    recordCheck(@"production_other_document_untouched", @{@"id": identity(untouched)});
+
+    handy_fixture_begin(controller, 3);
+    assertPaused(active, @"production_override_initial_pause");
+    command(@"play", active);
+    assertAdvancing(active, @"user_resume_observable");
+    command(@"pause", active);
+    assertPaused(active, @"user_pause_after_resume");
+    before = handy_qt_fixture_command_count();
+    handy_fixture_end(controller);
+    [NSThread sleepForTimeInterval:0.6];
+    assertPaused(active, @"production_observed_override_not_resumed");
+    probeRequire(handy_qt_fixture_command_count() == before, @"Production resumed after observed user override");
+
+    command(@"play", active);
+    assertAdvancing(active, @"seek_case_setup");
+    handy_fixture_begin(controller, 4);
+    assertPaused(active, @"seek_case_initial_pause");
+    double seekTo = position(active) + 3.0;
+    NSAppleEventDescriptor *setTime = [NSAppleEventDescriptor appleEventWithEventClass:kAECoreSuite
+        eventID:kAESetData targetDescriptor:target returnID:kAutoGenerateReturnID transactionID:kAnyTransactionID];
+    [setTime setParamDescriptor:spec(cProperty, active.document, formPropertyID,
+        [NSAppleEventDescriptor descriptorWithTypeCode:code(@"current_time")]) forKeyword:keyDirectObject];
+    [setTime setParamDescriptor:[NSAppleEventDescriptor descriptorWithDouble:seekTo] forKeyword:keyAEData];
+    NSError *seekError = nil;
+    NSAppleEventDescriptor *seekReply = [setTime sendEventWithOptions:NSAppleEventSendWaitForReply |
+        NSAppleEventSendNeverInteract | (NSAppleEventSendOptions)kAEDoNotPromptForUserConsent timeout:4 error:&seekError];
+    probeRequire(seekReply && !seekError && [seekReply paramDescriptorForKeyword:keyErrorNumber].int32Value == 0,
+        @"Fixture user seek failed");
+    [NSThread sleepForTimeInterval:0.7];
+    probeRequire(fabs(position(active) - seekTo) < 0.2, @"Fixture seek was not applied");
+    before = handy_qt_fixture_command_count();
+    handy_fixture_end(controller);
+    assertPaused(active, @"production_seek_override_not_resumed");
+    probeRequire(handy_qt_fixture_command_count() == before, @"Production resumed after a paused seek");
+
+    command(@"play", active);
+    assertAdvancing(active, @"replacement_case_setup");
+    handy_fixture_begin(controller, 5);
+    assertPaused(active, @"replacement_case_initial_pause");
+    NSString *oldID = identity(active);
+    NSURL *sameFile = active.file;
+    sendAppleEvent(kAECoreSuite, kAEClose, active.window, NO);
+    probeRequire(documents().numberOfItems == 1, @"Production replacement window did not close");
+    NSAppleEventDescriptor *newDocs = openFile(sameFile.path, 2);
+    ProbeTarget *newWindow = nil;
+    for (NSInteger i = 1; i <= newDocs.numberOfItems; ++i) {
+        ProbeTarget *item = freeze([newDocs descriptorAtIndex:i]);
+        if ([item.file isEqual:sameFile]) newWindow = item;
+    }
+    probeRequire(newWindow && ![identity(newWindow) isEqual:oldID], @"Replacement did not obtain new identity");
+    before = handy_qt_fixture_command_count();
+    handy_fixture_end(controller);
+    assertPaused(newWindow, @"production_reopened_file_not_resumed");
+    probeRequire(handy_qt_fixture_command_count() == before, @"Production retargeted a replacement window");
+
+    // Deliberately stop THIS disposable QuickTime process after the production
+    // preflight, immediately before its real AE send. The provider later handles
+    // the queued Pause after its reply deadline. This hook is absent from the
+    // application build; it does not replace transport or policy with a mock.
+    active = newWindow;
+    command(@"play", active);
+    assertAdvancing(active, @"late_pause_case_setup");
+    before = handy_qt_fixture_command_count();
+    handy_qt_fixture_stop_before_command(player.processIdentifier);
+    handy_fixture_begin(controller, 6);
+    for (int i = 0; i < 60 && handy_qt_fixture_command_count() == before; ++i)
+        [NSThread sleepForTimeInterval:0.05];
+    probeRequire(handy_qt_fixture_command_count() == before + 1, @"Late Pause did not reach real transport");
+    [NSThread sleepForTimeInterval:1.5];
+    handy_fixture_end(controller);
+    probeRequire(kill(player.processIdentifier, SIGCONT) == 0, @"Could not resume owned QuickTime fixture");
+    assertPaused(active, @"production_late_pause_effect_observed");
+    handy_fixture_begin(controller, 7);
+    [NSThread sleepForTimeInterval:1.0];
+    handy_fixture_end(controller);
+    assertPaused(active, @"production_unknown_reply_not_retried_or_resumed");
+    probeRequire(handy_qt_fixture_command_count() == before + 1, @"Uncertain operation was retried or compensated blindly");
+    recordCheck(@"production_unknown_lease_retained", @{@"commands": @(handy_qt_fixture_command_count() - before),
+        @"provider_delayed": @YES, @"expected_policy": @"quarantine until original process disappears"});
     report[@"status"] = @"passed";
     report[@"phase"] = @"complete";
 }
@@ -404,7 +521,7 @@ int main(int argc, const char **argv) {
         receipt = cfg[@"receipt"];
         checks = [NSMutableArray array];
         report = [@{@"status": @"running", @"phase": @"initializing",
-            @"scope": @"Public PID-addressed Apple Events and actual QuickTime only; not Handy backend coverage",
+            @"scope": @"Actual production Rust controller, QuickTime adapter and public Apple Events against real QuickTime",
             @"identity_mode": @"PID + launch date + window unique ID + unchanged file URL",
             @"identity_limit": @"A guarded window/file association, not a universal media-session token; in-place replacement by the same file is not observable.",
             @"probe_pid": @(getpid()), @"os": NSProcessInfo.processInfo.operatingSystemVersionString,
@@ -419,6 +536,7 @@ int main(int argc, const char **argv) {
                     report[@"error"] = error.reason ?: error.name;
                 }
                 @finally {
+                    if (ownsPlayer && player) (void)kill(player.processIdentifier, SIGCONT);
                     if (ownsPlayer && player && !player.terminated) {
                         [player terminate];
                         for (int i = 0; i < 20 && !player.terminated; ++i)
@@ -432,6 +550,7 @@ int main(int argc, const char **argv) {
                             report[@"cleanup_error"] = @"Owned QuickTime process did not terminate";
                         }
                     }
+                    if (controller) { handy_fixture_destroy(controller); controller = NULL; }
                     @try { save(); } @catch (NSException *error) { NSLog(@"%@", error); }
                     dispatch_async(dispatch_get_main_queue(), ^{ [NSApp terminate:nil]; });
                 }
@@ -571,6 +690,18 @@ def main():
     if receipt.exists():
         raise SystemExit(f"REFUSED: receipt already exists, choose a fresh VM/job: {receipt}")
     codes, digest = dictionary_codes()
+    expected_codes = {"window": 1668770158, "document": 1685021557, "current_time": 1953066341,
+                      "file": 1718185061, "playing": 1886151033, "window_id": 1229201440,
+                      "window_document": 1685021557, "play_class": 1297504082,
+                      "play_id": 1886151033, "pause_class": 1297504082, "pause_id": 1885435251}
+    if codes != expected_codes:
+        raise SystemExit("Installed QuickTime dictionary differs from the production adapter contract")
+    repo = Path(__file__).resolve().parents[2]
+    product_info = plistlib.loads((repo / "src-tauri/Info.plist").read_bytes())
+    product_entitlements = plistlib.loads((repo / "src-tauri/Entitlements.plist").read_bytes())
+    usage = product_info.get("NSAppleEventsUsageDescription")
+    if not usage or product_entitlements.get("com.apple.security.automation.apple-events") is not True:
+        raise SystemExit("Product Automation usage description or entitlement is absent")
     with tempfile.TemporaryDirectory(prefix="handy-quicktime-probe-", dir=runner_temp) as tmp:
         folder = Path(tmp)
         app = folder / "Handy Media Pause Probe.app"
@@ -580,14 +711,22 @@ def main():
                  "CFBundleExecutable": binary.name, "CFBundleName": "Handy Media Pause Probe",
                  "CFBundleDisplayName": "Handy Media Pause Probe", "CFBundlePackageType": "APPL",
                  "CFBundleVersion": "1", "LSUIElement": True,
-                 "NSAppleEventsUsageDescription": "Validate QuickTime playback on this isolated GitHub runner."}
+                 "NSAppleEventsUsageDescription": usage}
         (app / "Contents/Info.plist").write_bytes(plistlib.dumps(plist))
         entitlements = folder / "entitlements.plist"
-        entitlements.write_bytes(plistlib.dumps({"com.apple.security.automation.apple-events": True}))
+        entitlements.write_bytes(plistlib.dumps({"com.apple.security.automation.apple-events":
+                                                product_entitlements["com.apple.security.automation.apple-events"]}))
         source = folder / "probe.m"
         source.write_text(NATIVE, encoding="utf-8")
+        rust_target = folder / "rust-target"
+        run(["cargo", "build", "--manifest-path", str(repo / "src-tauri/tests/media-pause/Cargo.toml"),
+             "--locked", "--features", "quicktime-fixture", "--target-dir", str(rust_target)], timeout=300)
+        production = rust_target / "debug/libhandy_media_pause_tests.a"
+        if not production.is_file():
+            raise SystemExit("Actual production controller fixture archive was not built")
         run(["/usr/bin/xcrun", "clang", "-fobjc-arc", "-Wall", "-Wextra",
              "-framework", "Cocoa", "-framework", "ApplicationServices", "-framework", "CoreServices", str(source),
+             str(production),
              "-o", str(binary)], timeout=120)
         run(["/usr/bin/codesign", "--force", "--sign", "-", "--options", "runtime",
              "--entitlements", str(entitlements), str(app)])
@@ -609,7 +748,7 @@ def main():
             launch_args.extend(["--env", f"{key}={value}"])
         launch_args.extend([str(app), "--args", str(config)])
         launcher = subprocess.Popen(launch_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        deadline = time.monotonic() + 110
+        deadline = time.monotonic() + 160
         consent_deadline = time.monotonic() + 45
         clicks = []
         result = {}
@@ -645,8 +784,13 @@ def main():
                 result.update(status="failed", error="Bounded probe/consent timeout or missing final receipt")
             result["consent_ui_diagnostics"] = clicks
             result["machine_architecture"] = run(["/usr/bin/uname", "-m"]).stdout.strip()
+            result["production_sources_sha256"] = {
+                name: hashlib.sha256((repo / "src-tauri/src/managers" / name).read_bytes()).hexdigest()
+                for name in ("media_pause.rs", "media_pause_macos.rs", "media_pause_macos.m")
+            }
+            result["fixture_injection"] = "Hosted-only SIGSTOP immediately before one real AE send; absent from product build"
             result["limitations"] = [
-                "Real QuickTime transport fixture only; no Handy product backend executed.",
+                "Actual production controller and QuickTime adapter; Tauri settings UI itself is not exercised here.",
                 "Not proof of all-player support or lossless detection of user play-pause overrides.",
                 "PID plus launch identity reduces restart retargeting; checks are not an atomic OS session capability.",
                 "Window unique ID plus unchanged file URL is not a universal media-session token; same-file in-place replacement is not observable.",
@@ -672,6 +816,8 @@ def main():
                             and stamp.returncode == 0 and pid in process_starts
                             and stamp.stdout.strip() == process_starts[pid]):
                         try:
+                            if field == "player_pid":
+                                os.kill(pid, signal.SIGCONT)
                             os.kill(pid, signal.SIGTERM)
                         except ProcessLookupError:
                             pass

@@ -1,4 +1,8 @@
+#[path = "src/managers/media_pause_macos_build.rs"]
+mod media_pause_macos_build;
+
 fn main() {
+    media_pause_macos_build::build(std::path::Path::new("src/managers/media_pause_macos.m"), false);
     // A build script's cfg describes its host, not the application target.
     #[cfg(target_os = "macos")]
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos")

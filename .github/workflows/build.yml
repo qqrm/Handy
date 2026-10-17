@@ -595,6 +595,9 @@ jobs:
           signature=$(codesign -dv "$app" 2>&1)
           printf '%s\n' "$signature"
           printf '%s\n' "$signature" | grep -q 'Signature=adhoc'
+          test -n "$(/usr/libexec/PlistBuddy -c 'Print NSAppleEventsUsageDescription' "$app/Contents/Info.plist")"
+          codesign -d --entitlements :- "$app" > "$RUNNER_TEMP/handy-package-entitlements.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print com.apple.security.automation.apple-events' "$RUNNER_TEMP/handy-package-entitlements.plist")" = true
           test -z "$(find "$base" -name '*.sig' -print -quit)"
           python3 - "$binary" <<'PY'
           import os
