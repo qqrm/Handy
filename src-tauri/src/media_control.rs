@@ -4,6 +4,10 @@ use log::{debug, error, info, warn};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager};
 
+#[cfg(any(target_os = "windows", test))]
+#[path = "media_control_windows_batch.rs"]
+mod windows_batch;
+
 #[cfg(target_os = "windows")]
 #[path = "media_control_windows.rs"]
 mod platform_windows;

@@ -1,0 +1,22 @@
+[package]
+name = "handy-media-control-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Compile the production media-control modules without the Tauri / inference
+# build dependencies. Windows CI also type-checks and links the WinRT adapter.
+[lib]
+path = "lib.rs"
+
+[dependencies]
+log = "0.4.25"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.61.3", features = [
+  "Foundation",
+  "Foundation_Collections",
+  "Media_Control",
+  "Win32_Foundation",
+  "Win32_System_WinRT",
+] }

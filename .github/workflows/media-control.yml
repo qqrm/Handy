@@ -1,0 +1,42 @@
+name: "Windows media control"
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "src-tauri/src/media_control*"
+      - "src-tauri/tests/media-control/**"
+      - ".github/workflows/media-control.yml"
+  pull_request:
+    paths:
+      - "src-tauri/src/media_control*"
+      - "src-tauri/tests/media-control/**"
+      - ".github/workflows/media-control.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  media-control:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+      - name: Check harness formatting
+        run: cargo fmt --manifest-path src-tauri/tests/media-control/Cargo.toml -- --check
+      - name: Check media control with Clippy
+        run: cargo clippy --locked --manifest-path src-tauri/tests/media-control/Cargo.toml --all-targets -- -D warnings
+      - name: Test partial failures and playback recovery
+        run: cargo test --locked --manifest-path src-tauri/tests/media-control/Cargo.toml
