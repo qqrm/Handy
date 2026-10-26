@@ -4,13 +4,27 @@ on:
   workflow_dispatch:
   push:
     paths:
+      - "src-tauri/src/lib.rs"
       - "src-tauri/src/media_control*"
       - "src-tauri/tests/media-control/**"
+      - "src-tauri/Cargo.*"
+      - "src-tauri/build.rs"
+      - "src-tauri/tauri*.conf.json"
+      - ".cargo/**"
+      - "package.json"
+      - "bun.lock"
       - ".github/workflows/media-control.yml"
   pull_request:
     paths:
+      - "src-tauri/src/lib.rs"
       - "src-tauri/src/media_control*"
       - "src-tauri/tests/media-control/**"
+      - "src-tauri/Cargo.*"
+      - "src-tauri/build.rs"
+      - "src-tauri/tauri*.conf.json"
+      - ".cargo/**"
+      - "package.json"
+      - "bun.lock"
       - ".github/workflows/media-control.yml"
 
 permissions:
@@ -40,3 +54,54 @@ jobs:
         run: cargo clippy --locked --manifest-path src-tauri/tests/media-control/Cargo.toml --all-targets -- -D warnings
       - name: Test partial failures and playback recovery
         run: cargo test --locked --manifest-path src-tauri/tests/media-control/Cargo.toml
+
+  windows-app:
+    name: Full Windows application build
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Preserve LF line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+      - name: Check frontend lint
+        run: bun run lint
+      - name: Check formatting
+        run: bun run format:check
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
+      - name: Install SPIRV-Headers
+        shell: pwsh
+        run: |
+          vcpkg install spirv-headers:x64-windows
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install spirv-headers failed" }
+          $prefix = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows" -replace '\\','/'
+          $combined = if ($env:CMAKE_PREFIX_PATH) { "$prefix;$env:CMAKE_PREFIX_PATH" } else { $prefix }
+          Add-Content $env:GITHUB_ENV "CMAKE_PREFIX_PATH=$combined"
+      - name: Install ONNX Runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = "1.24.2"
+          $archive = Join-Path $env:RUNNER_TEMP "ort.zip"
+          $destination = Join-Path $env:RUNNER_TEMP "ort-dist"
+          Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v$version/onnxruntime-win-x64-$version.zip" -OutFile $archive
+          Expand-Archive -Path $archive -DestinationPath $destination -Force
+          $ortLib = (Resolve-Path "$destination/onnxruntime-win-x64-$version/lib").Path
+          Add-Content $env:GITHUB_ENV "ORT_LIB_LOCATION=$ortLib"
+          Add-Content $env:GITHUB_ENV "ORT_PREFER_DYNAMIC_LINK=1"
+      # Compile and link the real crate, including lib.rs, which the isolated
+      # media-control harness does not exercise. Skip installer signing.
+      - name: Build full Windows application
+        run: bun run tauri build --debug --no-bundle -- --locked

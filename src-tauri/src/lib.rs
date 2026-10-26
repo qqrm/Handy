@@ -12,10 +12,6 @@ mod input;
 mod llm_client;
 mod managers;
 mod media_control;
-#[cfg(target_os = "linux")]
-mod media_control_linux;
-#[cfg(target_os = "windows")]
-mod media_control_windows;
 #[cfg(target_os = "macos")]
 mod media_remote;
 mod overlay;
