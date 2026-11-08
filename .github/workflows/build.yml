@@ -43,7 +43,7 @@ on:
       ref:
         required: false
         type: string
-        default: ${{ github.ref }}
+        default: ${{ github.sha }}
       is-debug-build:
         required: false
         type: boolean
@@ -53,6 +53,32 @@ on:
         type: boolean
         default: false
 
+    secrets:
+      APPLE_ID:
+        required: false
+      APPLE_ID_PASSWORD:
+        required: false
+      APPLE_PASSWORD:
+        required: false
+      APPLE_TEAM_ID:
+        required: false
+      APPLE_CERTIFICATE:
+        required: false
+      APPLE_CERTIFICATE_PASSWORD:
+        required: false
+      KEYCHAIN_PASSWORD:
+        required: false
+      AZURE_CLIENT_ID:
+        required: false
+      AZURE_CLIENT_SECRET:
+        required: false
+      AZURE_TENANT_ID:
+        required: false
+      TAURI_SIGNING_PRIVATE_KEY:
+        required: false
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD:
+        required: false
+
 env:
   TSC_VERSION: "0.9.0"
 
@@ -60,6 +86,12 @@ jobs:
   build:
     # Inherit caller permissions: release callers grant write, PR checks read.
     runs-on: ${{ inputs.platform }}
+    env:
+      HANDY_PLATFORM: ${{ inputs.platform }}
+      HANDY_TARGET: ${{ inputs.target }}
+      HANDY_ASSET_PREFIX: ${{ inputs.asset-prefix }}
+      HANDY_ASSET_PATTERN: ${{ inputs.asset-name-pattern }}
+      HANDY_DEBUG_BUILD: ${{ inputs.is-debug-build }}
     steps:
       # Kept for git checkout and general tooling headroom. The native
       # transcribe-cpp-sys build no longer needs path help: since 0.1.3 its
@@ -76,7 +108,7 @@ jobs:
           git config --system core.longpaths true
 
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: ${{ inputs.repository }}
           ref: ${{ inputs.ref }}
@@ -94,17 +126,13 @@ jobs:
 
       - name: Get version from tauri.conf.json
         id: get-version
-        shell: bash
-        run: |
-          VERSION=$(grep -o '"version": "[^"]*"' src-tauri/tauri.conf.json | cut -d'"' -f4)
-          echo "Application version from tauri.conf.json: $VERSION"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        run: node scripts/ci/workflow-inputs.mjs version
 
       - name: Determine build profile
         id: build-profile
         shell: bash
         run: |
-          if [[ "${{ inputs.is-debug-build }}" == "true" ]]; then
+          if [[ "$HANDY_DEBUG_BUILD" == "true" ]]; then
             echo "profile=debug" >> "$GITHUB_OUTPUT"
             echo "Build profile: debug"
           else
@@ -113,10 +141,10 @@ jobs:
           fi
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
       - name: install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           # Those targets are only used on macos runners so it's in an `if` to slightly speed up windows and linux builds.
           targets: ${{ contains(inputs.platform, 'macos') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
@@ -126,7 +154,7 @@ jobs:
         # always compiled clean — no risk of a stale cached native lib being
         # linked. PR/test builds keep caching for speed.
         if: ${{ !inputs.no-cache }}
-        uses: swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: "./src-tauri -> target"
           key: ${{ inputs.platform }}-${{ inputs.target }}-no-bin-v1
@@ -172,7 +200,7 @@ jobs:
       # built there and no Vulkan SDK, headers, or glslc are needed.
       - name: Install Vulkan SDK (Windows x64)
         if: contains(inputs.platform, 'windows') && !contains(inputs.target, 'aarch64')
-        uses: humbletim/install-vulkan-sdk@v1.2
+        uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff # v1.2
         with:
           version: 1.4.309.0
           cache: true
@@ -180,14 +208,15 @@ jobs:
       - name: Cache trusted-signing-cli
         if: contains(inputs.platform, 'windows') && inputs.sign-binaries
         id: cache-tsc
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ~/.cargo/bin/trusted-signing-cli*
           key: trusted-signing-cli-${{ env.TSC_VERSION }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install trusted-signing-cli
         if: contains(inputs.platform, 'windows') && inputs.sign-binaries && steps.cache-tsc.outputs.cache-hit != 'true'
-        run: cargo install --locked --force trusted-signing-cli@${{ env.TSC_VERSION }}
+        shell: bash
+        run: cargo install --locked --force "trusted-signing-cli@$TSC_VERSION"
 
       - name: Prepare Vulkan SDK for Ubuntu 24.04
         if: contains(inputs.platform, 'ubuntu-24.04') && !contains(inputs.platform, 'arm')
@@ -200,7 +229,7 @@ jobs:
 
       - name: Prepare Vulkan SDK for Ubuntu ARM64
         if: contains(inputs.platform, 'ubuntu') && contains(inputs.platform, 'arm')
-        uses: jakoch/install-vulkan-sdk-action@v1
+        uses: jakoch/install-vulkan-sdk-action@7fe84289ddbf750f7eff9f8e4588e600e1dd06c8 # v1
         with:
           vulkan_version: 1.4.335.0
           cache: true
@@ -230,7 +259,8 @@ jobs:
 
       - name: rustup install target
         if: ${{ inputs.target != '' && !contains(inputs.target, 'x86_64-unknown-linux-gnu') && !contains(inputs.target, 'aarch64-unknown-linux-gnu') && !contains(inputs.target, 'x86_64-pc-windows-msvc') }}
-        run: rustup target add ${{ inputs.target }}
+        shell: bash
+        run: rustup target add "$HANDY_TARGET"
 
       - name: import Apple Developer Certificate
         if: contains(inputs.platform, 'macos') && inputs.sign-binaries
@@ -258,16 +288,8 @@ jobs:
 
       - name: Patch asset name pattern
         id: patch-release-name
-        shell: bash
         if: ${{ inputs.release-id != '' && inputs.asset-name-pattern != '' }}
-        run: |
-          platform="${{ inputs.platform }}"
-          replacement="$(echo ${platform} | sed -E 's/-latest//')"
-          patched_platform=$(echo '${{ inputs.asset-name-pattern }}' | sed -E "s/\[platform\]/${replacement}/")
-          if [[ -n "${{ inputs.asset-prefix }}" ]]; then
-            patched_platform="${{ inputs.asset-prefix }}_${patched_platform}"
-          fi
-          echo "platform=${patched_platform}" >> $GITHUB_OUTPUT
+        run: node scripts/ci/workflow-inputs.mjs asset-name
 
       # ggml refuses to build its ARM CPU backend under MSVC (upstream check in
       # ggml/src/ggml-cpu/CMakeLists.txt: "MSVC is not supported for ARM, use
@@ -327,7 +349,7 @@ jobs:
           if (-not $vsRoot) { throw "vswhere found no Visual Studio installation" }
           $versionFile = Join-Path $vsRoot "VC\Auxiliary\Build\Microsoft.VCRedistVersion.default.txt"
           $redistVersion = (Get-Content $versionFile).Trim()
-          $arch = if ("${{ inputs.target }}" -like "aarch64*") { "arm64" } else { "x64" }
+          $arch = if ($env:HANDY_TARGET -like "aarch64*") { "arm64" } else { "x64" }
           $archDir = Join-Path $vsRoot "VC\Redist\MSVC\$redistVersion\$arch"
           if (-not (Test-Path $archDir)) { throw "VC++ redist arch dir not found: $archDir" }
           # Glob the VC generation folder; the runtime DLL names stay ABI-stable.
@@ -471,9 +493,11 @@ jobs:
       - name: Pre-build and locate transcribe-cpp backend libs (Linux)
         if: contains(inputs.platform, 'ubuntu')
         shell: bash
+        env:
+          HANDY_BUILD_PROFILE: ${{ steps.build-profile.outputs.profile }}
         run: |
           set -euo pipefail
-          PROFILE="${{ steps.build-profile.outputs.profile }}"
+          PROFILE="$HANDY_BUILD_PROFILE"
           # Frontend must exist for the app crate to compile (generate_context!).
           bun run build
           (
@@ -660,9 +684,12 @@ jobs:
       - name: Verify AppImage version metadata
         if: contains(inputs.platform, 'ubuntu')
         shell: bash
+        env:
+          HANDY_BUILD_PROFILE: ${{ steps.build-profile.outputs.profile }}
+          HANDY_VERSION: ${{ steps.get-version.outputs.version }}
         run: |
           set -euo pipefail
-          PROFILE="${{ steps.build-profile.outputs.profile }}"
+          PROFILE="$HANDY_BUILD_PROFILE"
           APPIMAGE_PATH="$(find "src-tauri/target/${PROFILE}/bundle/appimage" -name '*.AppImage' -print -quit 2>/dev/null || true)"
           if [ -z "$APPIMAGE_PATH" ]; then
             echo "No AppImage produced by this Linux build; skipping metadata verification"
@@ -681,7 +708,7 @@ jobs:
               echo "ERROR: AppImage desktop metadata is missing" >&2
               exit 1
             fi
-            if ! grep -Fqx 'X-AppImage-Version=${{ steps.get-version.outputs.version }}' "$DESKTOP_FILE"; then
+            if ! grep -Fqx "X-AppImage-Version=$HANDY_VERSION" "$DESKTOP_FILE"; then
               echo "ERROR: AppImage version metadata is missing or incorrect:" >&2
               grep -E '^X-AppImage-Version=' "$DESKTOP_FILE" >&2 || true
               exit 1
@@ -711,7 +738,7 @@ jobs:
 
       - name: Upload artifacts (macOS)
         if: inputs.upload-artifacts && contains(inputs.platform, 'macos')
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ steps.build-policy.outputs.artifact-label }}${{ inputs.asset-prefix }}-${{ inputs.target }}
           path: |
@@ -722,6 +749,9 @@ jobs:
       - name: Audit Linux package runtime contents
         if: contains(inputs.platform, 'ubuntu')
         shell: bash
+        env:
+          HANDY_BUILD_PROFILE: ${{ steps.build-profile.outputs.profile }}
+          HANDY_VERSION: ${{ steps.get-version.outputs.version }}
         run: |
           set -euo pipefail
 
@@ -734,7 +764,7 @@ jobs:
             sudo apt-get install -y xvfb
           fi
 
-          PROFILE="${{ steps.build-profile.outputs.profile }}"
+          PROFILE="$HANDY_BUILD_PROFILE"
           BUNDLE_DIR="src-tauri/target/${PROFILE}/bundle"
 
           require_pattern() {
@@ -784,7 +814,7 @@ jobs:
               require_pattern "$listing" 'usr/bin/handy$' "handy binary"
               require_pattern "$listing" 'usr/lib/Handy/libtranscribe\.so(\.[0-9]+)+$' "transcribe runtime library (SONAME)"
               require_pattern "$listing" 'usr/lib/Handy/libggml-cpu.*\.so' "ggml CPU backend module"
-              if [[ "${{ inputs.platform }}" == *"ubuntu-22.04"* && "${{ inputs.target }}" == "x86_64-unknown-linux-gnu" ]]; then
+              if [[ "$HANDY_PLATFORM" == *"ubuntu-22.04"* && "$HANDY_TARGET" == "x86_64-unknown-linux-gnu" ]]; then
                 require_pattern "$listing" 'usr/lib/Handy/libonnxruntime\.so\.[0-9]+$' "ONNX Runtime library (SONAME)"
               fi
               # Handy's libs must stay out of the ldconfig-scanned /usr/lib
@@ -838,7 +868,7 @@ jobs:
                 # appimagetool does not update the copy under usr/share/applications.
                 desktop_file="$(find squashfs-root -maxdepth 1 -type f -name '*.desktop' -print -quit)"
                 require_path "$desktop_file" "AppImage desktop metadata"
-                if ! grep -Fqx 'X-AppImage-Version=${{ steps.get-version.outputs.version }}' "$desktop_file"; then
+                if ! grep -Fqx "X-AppImage-Version=$HANDY_VERSION" "$desktop_file"; then
                   echo "ERROR: AppImage version metadata is missing or incorrect:" >&2
                   grep -E '^X-AppImage-Version=' "$desktop_file" >&2 || true
                   exit 1
@@ -891,7 +921,7 @@ jobs:
 
       - name: Upload artifacts (Linux)
         if: inputs.upload-artifacts && contains(inputs.platform, 'ubuntu')
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ steps.build-policy.outputs.artifact-label }}${{ inputs.asset-prefix }}-${{ inputs.platform }}-${{ inputs.target }}
           path: |
@@ -903,9 +933,11 @@ jobs:
       - name: Verify unsigned test packaging has no updater signatures
         if: inputs.artifact-only && contains(inputs.platform, 'windows')
         shell: pwsh
+        env:
+          HANDY_BUILD_PROFILE: ${{ steps.build-profile.outputs.profile }}
         run: |
-          $profile = '${{ steps.build-profile.outputs.profile }}'
-          $target = '${{ inputs.target }}'
+          $profile = $env:HANDY_BUILD_PROFILE
+          $target = $env:HANDY_TARGET
           $base = 'src-tauri/target'
           if ($target -and $target -ne 'x86_64-pc-windows-msvc') { $base = Join-Path $base $target }
           $base = Join-Path $base $profile
@@ -927,9 +959,11 @@ jobs:
       - name: Audit Windows package runtime contents
         if: contains(inputs.platform, 'windows')
         shell: pwsh
+        env:
+          HANDY_BUILD_PROFILE: ${{ steps.build-profile.outputs.profile }}
         run: |
-          $profile = "${{ steps.build-profile.outputs.profile }}"
-          $target = "${{ inputs.target }}"
+          $profile = $env:HANDY_BUILD_PROFILE
+          $target = $env:HANDY_TARGET
           $base = "src-tauri/target"
           if ($target -and $target -ne "x86_64-pc-windows-msvc") {
             $bundleBase = Join-Path $base (Join-Path $target (Join-Path $profile "bundle"))
@@ -945,7 +979,7 @@ jobs:
 
           # x64 also ships dynamic transcribe/ggml/ORT DLLs; ARM64 is otherwise static.
           $requiredStaged = @("msvcp140.dll", "vcruntime140.dll")
-          if ("${{ inputs.target }}" -notlike "aarch64*") {
+          if ($env:HANDY_TARGET -notlike "aarch64*") {
             $requiredStaged += @("vcomp140.dll", "onnxruntime.dll")
             if (-not ($stagedDlls | Where-Object { $_.Name -like "*transcribe*" })) {
               throw "Staging is missing transcribe runtime DLLs"
@@ -979,10 +1013,10 @@ jobs:
             if ($LASTEXITCODE -ne 0) {
               throw "$Label handy.exe --list-devices failed"
             }
-            if ("${{ inputs.target }}" -like "aarch64*" -and $deviceOutput -match "kind=(vulkan|cuda|metal|gpu)") {
+            if ($env:HANDY_TARGET -like "aarch64*" -and $deviceOutput -match "kind=(vulkan|cuda|metal|gpu)") {
               throw "$Label Windows ARM64 package unexpectedly exposed a GPU compute device"
             }
-            if ("${{ inputs.target }}" -like "aarch64*" -and $deviceOutput -notmatch "kind=cpu") {
+            if ($env:HANDY_TARGET -like "aarch64*" -and $deviceOutput -notmatch "kind=cpu") {
               throw "$Label Windows ARM64 package did not expose its required CPU compute device"
             }
           }
@@ -1028,7 +1062,7 @@ jobs:
 
       - name: Upload artifacts (Windows)
         if: inputs.upload-artifacts && contains(inputs.platform, 'windows')
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ steps.build-policy.outputs.artifact-label }}${{ inputs.asset-prefix }}-${{ inputs.target }}
           path: |
