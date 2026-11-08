@@ -54,7 +54,7 @@ jobs:
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
-      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # snapshot 2026-05-09; await main functions
         with:
           name: handy-computer
           # PR derivations must not receive the shared cache write token.

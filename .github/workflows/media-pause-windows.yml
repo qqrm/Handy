@@ -176,7 +176,7 @@ jobs:
           components: clippy
       - name: Test production SMTC adapter and recording lifecycle
         run: cargo test --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri -> target
           key: windows-native-media-pause
