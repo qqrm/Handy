@@ -15,7 +15,7 @@ concurrency:
 jobs:
   build:
     permissions:
-      contents: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -50,4 +50,16 @@ jobs:
       upload-artifacts: ${{ github.repository == 'cjpais/Handy' }}
       sign-binaries: ${{ github.repository == 'cjpais/Handy' }}
       artifact-only: ${{ github.repository != 'cjpais/Handy' }}
-    secrets: inherit
+    secrets:
+      APPLE_ID: ${{ github.repository == 'cjpais/Handy' && startsWith(matrix.platform, 'macos') && secrets.APPLE_ID || '' }}
+      APPLE_ID_PASSWORD: ${{ github.repository == 'cjpais/Handy' && startsWith(matrix.platform, 'macos') && secrets.APPLE_ID_PASSWORD || '' }}
+      APPLE_PASSWORD: ${{ github.repository == 'cjpais/Handy' && startsWith(matrix.platform, 'macos') && secrets.APPLE_PASSWORD || '' }}
+      APPLE_TEAM_ID: ${{ github.repository == 'cjpais/Handy' && startsWith(matrix.platform, 'macos') && secrets.APPLE_TEAM_ID || '' }}
+      APPLE_CERTIFICATE: ${{ github.repository == 'cjpais/Handy' && startsWith(matrix.platform, 'macos') && secrets.APPLE_CERTIFICATE || '' }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ github.repository == 'cjpais/Handy' && startsWith(matrix.platform, 'macos') && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+      KEYCHAIN_PASSWORD: ${{ github.repository == 'cjpais/Handy' && startsWith(matrix.platform, 'macos') && secrets.KEYCHAIN_PASSWORD || '' }}
+      AZURE_CLIENT_ID: ${{ github.repository == 'cjpais/Handy' && startsWith(matrix.platform, 'windows') && secrets.AZURE_CLIENT_ID || '' }}
+      AZURE_CLIENT_SECRET: ${{ github.repository == 'cjpais/Handy' && startsWith(matrix.platform, 'windows') && secrets.AZURE_CLIENT_SECRET || '' }}
+      AZURE_TENANT_ID: ${{ github.repository == 'cjpais/Handy' && startsWith(matrix.platform, 'windows') && secrets.AZURE_TENANT_ID || '' }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ github.repository == 'cjpais/Handy' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ github.repository == 'cjpais/Handy' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
