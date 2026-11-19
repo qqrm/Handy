@@ -82,8 +82,21 @@ fn native_windows_machine() -> Option<u16> {
 }
 
 /// Centralized cancellation function that can be called from anywhere in the app.
-/// Handles cancelling both recording and transcription operations and updates UI state.
+/// The coordinator keeps new starts queued until all cancellation cleanup finishes.
 pub fn cancel_current_operation(app: &AppHandle) {
+    if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
+        coordinator.cancel();
+    } else {
+        // Startup/teardown can precede the coordinator's registration. Keep
+        // cancellation off the UI thread even in that case.
+        let app = app.clone();
+        std::thread::spawn(move || finish_cancellation(&app));
+    }
+}
+
+/// Runs on the coordinator's cancellation worker. Its completion must include
+/// stream and UI cleanup, not just the end of microphone capture.
+pub(crate) fn finish_cancellation(app: &AppHandle) {
     info!("Initiating operation cancellation...");
 
     // Unregister the cancel shortcut asynchronously
@@ -91,7 +104,6 @@ pub fn cancel_current_operation(app: &AppHandle) {
 
     // Cancel any ongoing recording
     let audio_manager = app.state::<Arc<AudioRecordingManager>>();
-    let recording_was_active = audio_manager.is_recording();
     audio_manager.cancel_recording();
 
     // Abandon any live streaming transcription
@@ -104,11 +116,6 @@ pub fn cancel_current_operation(app: &AppHandle) {
 
     // Unload model if immediate unload is enabled
     tm.maybe_unload_immediately("cancellation");
-
-    // Notify coordinator so it can keep lifecycle state coherent.
-    if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
-        coordinator.notify_cancel(recording_was_active);
-    }
 
     info!("Operation cancellation completed - returned to idle state");
 }

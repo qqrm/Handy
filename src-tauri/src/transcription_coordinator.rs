@@ -1,12 +1,10 @@
 use crate::actions::ACTION_MAP;
-use crate::managers::audio::AudioRecordingManager;
 use crate::settings::ShortcutActivation;
 use log::{debug, error, warn};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 const DEBOUNCE: Duration = Duration::from_millis(30);
 const RELEASE_GRACE: Duration = Duration::from_millis(50);
@@ -124,6 +122,7 @@ fn classify_busy_input(
 enum Stage {
     Idle,
     Recording(String), // binding_id
+    /// Transcription or cancellation still owns the previous operation.
     Processing,
 }
 
@@ -170,8 +169,29 @@ enum Effect {
 /// Commands processed sequentially by the coordinator thread.
 enum Command {
     Input(InputEvent),
-    Cancel { recording_was_active: bool },
+    Cancel,
+    CancellationFinished,
     ProcessingFinished,
+}
+
+/// The cancel worker owns this until capture, stream and UI cleanup are all
+/// finished. Sending on drop also releases the coordinator on an early exit.
+struct CancellationGuard(Sender<Command>);
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        if self.0.send(Command::CancellationFinished).is_err() {
+            warn!("Transcription coordinator channel closed");
+        }
+    }
+}
+
+fn spawn_cancellation(tx: Sender<Command>, cancel: impl FnOnce() + Send + 'static) {
+    let finish = CancellationGuard(tx);
+    thread::spawn(move || {
+        let _guard = finish;
+        cancel();
+    });
 }
 
 /// Decide whether a key-up should be deferred (so auto-repeat can cancel it)
@@ -218,6 +238,8 @@ fn classify_ptt_event(
 ///   short tap locks the session, and the next press stops
 struct CoordinatorState {
     stage: Stage,
+    processing_pending: bool,
+    cancellation_pending: bool,
     hold: Option<Hold>,
     last_press: Option<Instant>,
     pending_release: Option<PendingRelease>,
@@ -228,6 +250,8 @@ impl CoordinatorState {
     fn new() -> Self {
         Self {
             stage: Stage::Idle,
+            processing_pending: false,
+            cancellation_pending: false,
             hold: None,
             last_press: None,
             pending_release: None,
@@ -458,21 +482,40 @@ impl CoordinatorState {
         None
     }
 
-    fn on_cancel(&mut self, recording_was_active: bool) {
+    /// Returns whether a cleanup worker must be started. Repeated cancellation
+    /// still clears remembered input but shares the existing worker.
+    fn on_cancel(&mut self) -> bool {
         self.pending_release = None;
         // An explicit cancel abandons any remembered start too — the user
         // asked for silence, not a deferred recording.
         self.pending_press = None;
-        // Don't reset during processing — wait for the pipeline to finish.
-        if !matches!(self.stage, Stage::Processing)
-            && (recording_was_active || matches!(self.stage, Stage::Recording(_)))
-        {
-            self.stage = Stage::Idle;
-            self.hold = None;
+        self.hold = None;
+        // Both a stop task and a cancellation worker may own part of the old
+        // operation. Neither completion alone can authorize the next start.
+        self.stage = Stage::Processing;
+        !std::mem::replace(&mut self.cancellation_pending, true)
+    }
+
+    fn on_cancellation_finished(&mut self) -> Option<Effect> {
+        if !self.cancellation_pending {
+            return None;
         }
+        self.cancellation_pending = false;
+        self.on_drained()
     }
 
     fn on_processing_finished(&mut self) -> Option<Effect> {
+        if !self.processing_pending {
+            return None;
+        }
+        self.processing_pending = false;
+        self.on_drained()
+    }
+
+    fn on_drained(&mut self) -> Option<Effect> {
+        if self.processing_pending || self.cancellation_pending {
+            return None;
+        }
         self.stage = Stage::Idle;
         self.hold = None;
         let pending = self.pending_press.take()?;
@@ -517,6 +560,7 @@ impl CoordinatorState {
 
     fn begin_processing(&mut self, binding_id: String, hotkey_string: String) -> Effect {
         self.stage = Stage::Processing;
+        self.processing_pending = true;
         self.hold = None;
         Effect::Stop {
             binding_id,
@@ -541,6 +585,7 @@ pub fn is_transcribe_binding(id: &str) -> bool {
 impl TranscriptionCoordinator {
     pub fn new(app: AppHandle) -> Self {
         let (tx, rx) = mpsc::channel();
+        let cancellation_tx = tx.clone();
 
         thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -565,21 +610,7 @@ impl TranscriptionCoordinator {
                         }
                     };
 
-                    match cmd {
-                        Command::Input(input) => {
-                            if let Some(effect) = state.on_input(input, Instant::now()) {
-                                run_effect(&app, &mut state, effect);
-                            }
-                        }
-                        Command::Cancel {
-                            recording_was_active,
-                        } => state.on_cancel(recording_was_active),
-                        Command::ProcessingFinished => {
-                            if let Some(effect) = state.on_processing_finished() {
-                                run_effect(&app, &mut state, effect);
-                            }
-                        }
-                    }
+                    dispatch_command(&app, &mut state, cmd, &cancellation_tx);
                 }
                 debug!("Transcription coordinator exited");
             }));
@@ -649,14 +680,8 @@ impl TranscriptionCoordinator {
         }
     }
 
-    pub fn notify_cancel(&self, recording_was_active: bool) {
-        if self
-            .tx
-            .send(Command::Cancel {
-                recording_was_active,
-            })
-            .is_err()
-        {
+    pub fn cancel(&self) {
+        if self.tx.send(Command::Cancel).is_err() {
             warn!("Transcription coordinator channel closed");
         }
     }
@@ -664,6 +689,39 @@ impl TranscriptionCoordinator {
     pub fn notify_processing_finished(&self) {
         if self.tx.send(Command::ProcessingFinished).is_err() {
             warn!("Transcription coordinator channel closed");
+        }
+    }
+}
+
+fn dispatch_command(
+    app: &AppHandle,
+    state: &mut CoordinatorState,
+    command: Command,
+    cancellation_tx: &Sender<Command>,
+) {
+    match command {
+        Command::Input(input) => {
+            if let Some(effect) = state.on_input(input, Instant::now()) {
+                run_effect(app, state, effect);
+            }
+        }
+        Command::Cancel => {
+            if state.on_cancel() {
+                let app = app.clone();
+                spawn_cancellation(cancellation_tx.clone(), move || {
+                    crate::utils::finish_cancellation(&app);
+                });
+            }
+        }
+        Command::CancellationFinished => {
+            if let Some(effect) = state.on_cancellation_finished() {
+                run_effect(app, state, effect);
+            }
+        }
+        Command::ProcessingFinished => {
+            if let Some(effect) = state.on_processing_finished() {
+                run_effect(app, state, effect);
+            }
         }
     }
 }
@@ -691,10 +749,7 @@ fn start(app: &AppHandle, binding_id: &str, hotkey_string: &str) -> bool {
         warn!("No action in ACTION_MAP for '{binding_id}'");
         return false;
     };
-    action.start(app, binding_id, hotkey_string);
-    let recording = app
-        .try_state::<Arc<AudioRecordingManager>>()
-        .is_some_and(|a| a.is_recording());
+    let recording = action.start(app, binding_id, hotkey_string);
     if !recording {
         debug!("Start for '{binding_id}' did not begin recording; staying idle");
     }
@@ -1069,7 +1124,7 @@ mod tests {
         let effect = state.on_input(ptt_input(true), now + Duration::from_millis(200));
         assert!(effect.is_none());
 
-        state.on_cancel(false);
+        state.on_cancel();
         assert_eq!(
             state.stage,
             Stage::Processing,
@@ -1081,6 +1136,132 @@ mod tests {
             effect.is_none(),
             "cancelled session must not spawn a deferred recording"
         );
+        assert_eq!(state.stage, Stage::Processing);
+        assert!(state.on_cancellation_finished().is_none());
+        assert_eq!(state.stage, Stage::Idle);
+    }
+
+    /// The stop task can lose its capture token to Cancel and finish immediately.
+    /// Neither that completion nor the end of capture may bypass the remaining
+    /// stream/UI cleanup. All ordering here is enforced by channels, not sleeps.
+    #[test]
+    fn cancelled_stop_waits_for_capture_and_cancellation_cleanup_before_restart() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        drive_into_processing(&mut state, now);
+        state.on_cancel();
+
+        let (tx, rx) = mpsc::channel();
+        let (capture_entered_tx, capture_entered_rx) = mpsc::channel();
+        let (capture_release_tx, capture_release_rx) = mpsc::channel();
+        let (cleanup_entered_tx, cleanup_entered_rx) = mpsc::channel();
+        let (cleanup_release_tx, cleanup_release_rx) = mpsc::channel();
+        let timeout = Duration::from_secs(5);
+        spawn_cancellation(tx, move || {
+            capture_entered_tx.send(()).unwrap();
+            capture_release_rx.recv_timeout(timeout).unwrap();
+            // The recorder is now Idle, but the old cancellation still owns
+            // cancel_stream, overlay/tray cleanup and immediate model unload.
+            cleanup_entered_tx.send(()).unwrap();
+            cleanup_release_rx.recv_timeout(timeout).unwrap();
+        });
+        capture_entered_rx.recv_timeout(timeout).unwrap();
+
+        assert!(state.on_processing_finished().is_none());
+        assert_eq!(state.stage, Stage::Processing);
+        assert!(state.on_input(toggle_input(true), now + ms(200)).is_none());
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        capture_release_tx.send(()).unwrap();
+        cleanup_entered_rx.recv_timeout(timeout).unwrap();
+        assert_eq!(state.stage, Stage::Processing);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        cleanup_release_tx.send(()).unwrap();
+        assert!(matches!(
+            rx.recv_timeout(timeout).unwrap(),
+            Command::CancellationFinished
+        ));
+        assert!(matches!(
+            state.on_cancellation_finished(),
+            Some(Effect::Start { .. })
+        ));
+        assert_eq!(state.stage, Stage::Recording(BINDING.to_string()));
+        assert!(rx.try_recv().is_err());
+        // A completed pipeline cannot later reset the newly started session.
+        assert!(state.on_processing_finished().is_none());
+        assert_eq!(state.stage, Stage::Recording(BINDING.to_string()));
+    }
+
+    #[test]
+    fn cancellation_finishing_first_still_waits_for_the_stop_pipeline() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        drive_into_processing(&mut state, now);
+        state.on_cancel();
+
+        let (tx, rx) = mpsc::channel();
+        spawn_cancellation(tx, || {});
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Command::CancellationFinished
+        ));
+        assert!(state.on_cancellation_finished().is_none());
+        assert_eq!(state.stage, Stage::Processing);
+        assert!(state.on_input(toggle_input(true), now + ms(200)).is_none());
+
+        assert!(matches!(
+            state.on_processing_finished(),
+            Some(Effect::Start { .. })
+        ));
+        assert_eq!(state.stage, Stage::Recording(BINDING.to_string()));
+    }
+
+    #[test]
+    fn repeated_cancellation_shares_cleanup_and_discards_the_abandoned_press() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        assert!(matches!(
+            state.on_input(toggle_input(true), now),
+            Some(Effect::Start { .. })
+        ));
+        let (tx, rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let timeout = Duration::from_secs(5);
+
+        assert!(state.on_cancel());
+        spawn_cancellation(tx, move || {
+            release_rx.recv_timeout(timeout).unwrap();
+        });
+        assert!(state.on_input(toggle_input(true), now + ms(200)).is_none());
+        assert!(
+            !state.on_cancel(),
+            "an existing worker already owns cleanup"
+        );
+        assert_eq!(state.stage, Stage::Processing);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            rx.recv_timeout(timeout).unwrap(),
+            Command::CancellationFinished
+        ));
+        assert!(state.on_cancellation_finished().is_none());
+        assert_eq!(state.stage, Stage::Idle);
+        assert!(matches!(
+            state.on_input(toggle_input(true), now + ms(300)),
+            Some(Effect::Start { .. })
+        ));
+        assert!(state.on_cancellation_finished().is_none());
+        assert_eq!(state.stage, Stage::Recording(BINDING.to_string()));
+    }
+
+    #[test]
+    fn cancellation_while_idle_drains_without_a_stop_pipeline() {
+        let mut state = CoordinatorState::new();
+        state.on_cancel();
+        assert_eq!(state.stage, Stage::Processing);
+        assert!(state.on_cancellation_finished().is_none());
         assert_eq!(state.stage, Stage::Idle);
     }
 
@@ -1438,7 +1619,9 @@ mod tests {
         assert!(state.on_grace_expired().is_none());
         assert!(state.is_locked());
 
-        state.on_cancel(true);
+        state.on_cancel();
+        assert_eq!(state.stage, Stage::Processing);
+        assert!(state.on_cancellation_finished().is_none());
         assert_eq!(state.stage, Stage::Idle);
         assert!(!state.is_locked());
         assert!(matches!(

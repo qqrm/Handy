@@ -50,7 +50,8 @@ impl Drop for FinishGuard {
 
 // Shortcut Action Trait
 pub trait ShortcutAction: Send + Sync {
-    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str);
+    /// Returns whether this call started a recording.
+    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) -> bool;
     fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str);
 }
 
@@ -467,7 +468,7 @@ pub(crate) async fn process_transcription_output(
 }
 
 impl ShortcutAction for TranscribeAction {
-    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) -> bool {
         let start_time = Instant::now();
         debug!("TranscribeAction::start called for binding: {}", binding_id);
 
@@ -495,7 +496,7 @@ impl ShortcutAction for TranscribeAction {
                 .get_model_path(&selected_model)
             {
                 warn!("Not starting recording: no model can transcribe it ({})", e);
-                return;
+                return false;
             }
         }
 
@@ -610,7 +611,8 @@ impl ShortcutAction for TranscribeAction {
             }
         }
 
-        if recording_error.is_none() {
+        let started = recording_error.is_none();
+        if started {
             // Dynamically register the cancel shortcut in a separate task to avoid deadlock
             shortcut::register_cancel_shortcut(app);
         } else {
@@ -641,12 +643,14 @@ impl ShortcutAction for TranscribeAction {
             "TranscribeAction::start completed in {:?}",
             start_time.elapsed()
         );
+        started
     }
 
     fn stop(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
         // The coordinator has already entered Processing. Cancellation can
         // remove the recording before we obtain its token, so even that early
-        // return must signal completion instead of leaving Processing stuck.
+        // return must signal pipeline completion. The coordinator also waits
+        // for the entire cancellation worker before accepting another start.
         let tm = Arc::clone(&app.state::<Arc<TranscriptionManager>>());
         let finish = FinishGuard(app.clone(), Arc::clone(&tm));
         // Prevent a slow microphone from emitting a ready event or start chime
@@ -913,8 +917,9 @@ impl ShortcutAction for TranscribeAction {
 struct CancelAction;
 
 impl ShortcutAction for CancelAction {
-    fn start(&self, app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
+    fn start(&self, app: &AppHandle, _binding_id: &str, _shortcut_str: &str) -> bool {
         utils::cancel_current_operation(app);
+        false
     }
 
     fn stop(&self, _app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
@@ -926,13 +931,14 @@ impl ShortcutAction for CancelAction {
 struct TestAction;
 
 impl ShortcutAction for TestAction {
-    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) {
+    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) -> bool {
         log::info!(
             "Shortcut ID '{}': Started - {} (App: {})", // Changed "Pressed" to "Started" for consistency
             binding_id,
             shortcut_str,
             app.package_info().name
         );
+        false
     }
 
     fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) {

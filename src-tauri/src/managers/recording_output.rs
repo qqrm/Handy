@@ -5,6 +5,10 @@ use super::output_mute::{mute_default_output, MutedOutput};
 use log::warn;
 use std::sync::{Arc, Mutex};
 
+// Bound retained work if many different outputs disappear before restoration.
+// At capacity, refuse another mutation rather than losing an existing owner.
+const MAX_MUTE_LEASES: usize = 32;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct OutputOptions {
     pub mute: bool,
@@ -28,19 +32,20 @@ struct Recording {
 #[derive(Default)]
 struct State {
     recording: Option<Recording>,
-    // A failed restoration retains its original endpoint for the next cleanup.
-    // Do not acquire another lease until this one has been restored.
-    muted: Option<Box<dyn MutedOutput>>,
+    // Failed restores retain their original outputs. An unavailable old output
+    // must not prevent muting a healthy new default on the next recording.
+    muted: Vec<Box<dyn MutedOutput>>,
 }
 
 impl State {
     fn restore_mute(&mut self) {
-        if let Some(muted) = self.muted.as_mut() {
-            match muted.restore() {
-                Ok(()) => self.muted = None,
-                Err(error) => warn!("Could not restore recording output mute: {error}"),
+        self.muted.retain_mut(|muted| match muted.restore() {
+            Ok(()) => false,
+            Err(error) => {
+                warn!("Could not restore recording output mute: {error}");
+                true
             }
-        }
+        });
     }
 }
 
@@ -114,7 +119,8 @@ impl RecordingOutputController {
             warn!("Refusing overlapping recording output generation {generation}");
             return;
         }
-        state.restore_mute();
+        // Capture has already started. Retry retained restores only at a later
+        // cleanup boundary, never by unmuting an output into this new capture.
         self.0.backend.begin(generation);
         state.recording = Some(Recording {
             generation,
@@ -134,11 +140,16 @@ impl RecordingOutputController {
         }
         let options = recording.options;
         recording.phase = Phase::Applied;
-        if options.mute && state.muted.is_none() {
+        if options.mute && state.muted.len() < MAX_MUTE_LEASES {
             match self.0.backend.mute() {
-                Ok(muted) => state.muted = muted,
+                Ok(Some(muted)) => state.muted.push(muted),
+                // Includes an output still muted by a retained lease: keep
+                // that owner instead of acquiring a conflicting snapshot.
+                Ok(None) => {}
                 Err(error) => warn!("Could not mute recording output: {error}"),
             }
+        } else if options.mute {
+            warn!("Too many pending output restorations; refusing another mute");
         }
         // Pause is independent of mute success; the SMTC worker cannot delay mute.
         if options.pause {

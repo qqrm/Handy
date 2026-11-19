@@ -7,6 +7,8 @@ on:
       - "scripts/ci/quicktime_probe.py"
       - "scripts/ci/audio_lifecycle_before_fix.rs"
       - "scripts/ci/recording_output_regressions.py"
+      - "scripts/ci/coordinator_regressions.py"
+      - "scripts/ci/coordinator_lifecycle_fixture.rs"
       - ".github/workflows/media-pause-windows.yml"
   push:
     branches: [main]
@@ -15,6 +17,8 @@ on:
       - "scripts/ci/quicktime_probe.py"
       - "scripts/ci/audio_lifecycle_before_fix.rs"
       - "scripts/ci/recording_output_regressions.py"
+      - "scripts/ci/coordinator_regressions.py"
+      - "scripts/ci/coordinator_lifecycle_fixture.rs"
       - ".github/workflows/media-pause-windows.yml"
   workflow_dispatch:
 
@@ -55,7 +59,7 @@ jobs:
       - name: Check formatting
         if: always() && matrix.platform == 'ubuntu-24.04'
         run: cargo fmt --manifest-path src-tauri/tests/media-pause/Cargo.toml -- --check
-      - name: Prove historical failures and regression-test sensitivity
+      - name: Prove output and Stop/Cancel regressions with production code
         id: regression_evidence
         if: matrix.platform == 'ubuntu-24.04'
         run: python3 scripts/ci/recording_output_regressions.py --output "$RUNNER_TEMP/recording-output-evidence"

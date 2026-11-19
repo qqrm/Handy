@@ -47,24 +47,33 @@ pause/mute ownership through the capture tail and actual recorder stop. Stop and
 Cancel share the same cleanup boundary, including when the microphone stays
 open in always-on or lazy-close mode. Cleanup finishes before the manager
 publishes Idle. Delayed work from an older recording cannot mutate a newer one.
+The coordinator also waits for both the Stop pipeline and the entire Cancel
+worker, including stream/model and UI cleanup calls, before accepting a queued
+restart. Repeated Cancel shares one cleanup worker. Each Start reports whether
+that call actually started capture, rather than sampling an older recording.
 
 Mute ownership records the exact output selected before its state is read or
 changed. Restoration never targets a newly selected default. An already-muted
 or unreadable output is left alone. Failed restoration retains ownership for a
-later cleanup attempt and prevents another mute lease from overwriting it.
+later cleanup attempt without blocking mute on a healthy new default. Returning
+to an output still muted by a retained lease preserves that owner. Retries happen
+only after capture stops or closes, never at the start of another capture. At most
+32 mute leases are retained; reaching that bound refuses another mute instead of
+discarding an existing restoration obligation.
 Settings changes affect the next capture; they do not release the current
 capture's protection early.
 
 ### Evidence layers
 
-| Layer                 | What is checked                                                                                                                                                                                                                                    | Limit                                                                                                                                   |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| Historical RED        | Unchanged `AudioRecordingManager` method bodies from `bf42308f755749e61b1dbda5bef613d629842d9a` reproduce AlwaysOn/lazy Cancel, early resume into tail capture, stale mute, and default-output retargeting                                         | Recorder, settings, output endpoints, SMTC transport, and lazy timer are explicit fake collaborators; this is not the whole application |
-| Current runtime GREEN | Actual `recording_output.rs` and `output_mute.rs` with deterministic collaborators: all four settings combinations, stop/cancel ordering, delayed readiness, overlapping generations, original mute state, failed restoration, and output identity | Does not open a microphone or render physical audio                                                                                     |
-| Mutation sensitivity  | Each deliberately reintroduced production-code fault must compile, then fail one exact previously-passing regression test                                                                                                                          | A compile error, timeout, skipped test, or zero matches never counts as detecting the fault                                             |
-| Application wiring    | Source contracts check actual Stop/Cancel capture closures, protected tail, coordinator completion, stop-cue order, and Windows endpoint reopening; full application compilation remains mandatory                                                 | Static integration checks are reported separately from runtime controller tests                                                         |
-| Native Linux output   | Actual PulseAudio commands on an isolated server mute one sink, switch the default, and restore only the original sink                                                                                                                             | Null sinks exercise the audio service, not speakers or acoustic microphone pickup                                                       |
-| Native Windows        | Actual SMTC/video-only playback and compilation of the production COM endpoint adapter                                                                                                                                                             | Hosted Windows has no guaranteed audio endpoint; neither audible mute nor switching two physical Windows outputs is claimed             |
+| Layer                 | What is checked                                                                                                                                                                                                                                         | Limit                                                                                                                                                         |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Historical RED        | Unchanged `AudioRecordingManager` method bodies from `bf42308f755749e61b1dbda5bef613d629842d9a` reproduce AlwaysOn/lazy Cancel, early resume into tail capture, stale mute, and default-output retargeting                                              | Recorder, settings, output endpoints, SMTC transport, and lazy timer are explicit fake collaborators; this is not the whole application                       |
+| Current runtime GREEN | Actual `recording_output.rs` and `output_mute.rs` with deterministic collaborators: all four settings combinations, stop/cancel ordering, delayed readiness, overlapping generations, original mute state, failed restoration, and output identity      | Does not open a microphone or render physical audio                                                                                                           |
+| Stop/Cancel runtime   | The complete production coordinator and its tests, unchanged manager lifecycle methods, actual `TranscribeAction::start`, `FinishGuard`, no-token Stop entry, and centralized Cancel functions; channel gates exercise capture and post-capture cleanup | External microphone, model, UI and output services are explicit fakes; successful-token transcription and deferred platform UI tasks are outside this fixture |
+| Mutation sensitivity  | Each deliberately reintroduced production-code fault must compile, then fail one exact previously-passing regression test                                                                                                                               | A compile error, timeout, skipped test, or zero matches never counts as detecting the fault                                                                   |
+| Application wiring    | Source contracts check actual Stop/Cancel capture closures, protected tail, coordinator completion, stop-cue order, and Windows endpoint reopening; full application compilation remains mandatory                                                      | Static integration checks are reported separately from runtime controller tests                                                                               |
+| Native Linux output   | Actual PulseAudio commands on an isolated server mute one sink, switch the default, and restore only the original sink                                                                                                                                  | Null sinks exercise the audio service, not speakers or acoustic microphone pickup                                                                             |
+| Native Windows        | Actual SMTC/video-only playback and compilation of the production COM endpoint adapter                                                                                                                                                                  | Hosted Windows has no guaranteed audio endpoint; neither audible mute nor switching two physical Windows outputs is claimed                                   |
 
 Run the complete portable evidence procedure with:
 
@@ -80,6 +89,11 @@ compilation, and exact assertion outcomes in `receipt.json` with the associated
 logs and extracted historical source. The historical fixture includes two
 passing sanity checks; its five intentional RED assertions are evidence of the
 old faults, not failures of the corrected implementation.
+The nested `coordinator/receipt.json` records 43 coordinator/runtime tests and
+four compiled mutations for premature completion, false Start success, early
+Cancel completion and duplicate cleanup workers. The output-controller layer
+checks ten compiled mutations, including failed restoration on an old output
+blocking mute of a new default and restoration during a later capture.
 
 CI runs this procedure once on Ubuntu, alongside ordinary Linux/macOS/Windows
 tests and full Windows application compilation. The small

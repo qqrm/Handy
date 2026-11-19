@@ -291,7 +291,7 @@ fn mute_failure_does_not_disable_pause() {
 }
 
 #[test]
-fn failed_restore_retains_lease_and_suppresses_another_mute() {
+fn failed_restore_retains_existing_mute_until_next_capture_finishes() {
     let (controller, output) = controller();
     controller.begin(1, both());
     controller.ready(1);
@@ -299,12 +299,118 @@ fn failed_restore_retains_lease_and_suppresses_another_mute() {
     controller.finish_after_capture(1, || ());
     assert_eq!(output.protected(), (true, false));
     controller.begin(2, both());
+    assert_eq!(output.restore_calls.load(Ordering::SeqCst), 1);
     controller.ready(2);
-    assert_eq!(output.mute_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(output.mute_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(controller.0.state.lock().unwrap().muted.len(), 1);
     assert_eq!(output.protected(), (true, true));
     output.restore_error.store(false, Ordering::SeqCst);
     controller.finish_after_capture(2, || ());
     assert_eq!(output.protected(), (false, false));
+}
+
+// A separate device state for each default makes a retained A distinguishable
+// from the healthy B that a subsequent recording must still protect.
+#[derive(Clone)]
+struct SwitchingOutput(Arc<Mutex<Arc<FakeOutput>>>);
+
+impl OutputBackend for SwitchingOutput {
+    fn begin(&self, _: u64) {}
+
+    fn mute(&self) -> Result<Option<Box<dyn MutedOutput>>, String> {
+        FakeBackend(self.0.lock().unwrap().clone()).mute()
+    }
+
+    fn pause(&self, _: u64) {}
+    fn resume(&self) {}
+    fn drain(&self) {}
+}
+
+fn mute_only() -> OutputOptions {
+    OutputOptions {
+        mute: true,
+        pause: false,
+    }
+}
+
+#[test]
+fn failed_restore_does_not_disable_new_default_mute() {
+    let original = Arc::new(FakeOutput::default());
+    let replacement = Arc::new(FakeOutput::default());
+    let output = SwitchingOutput(Arc::new(Mutex::new(original.clone())));
+    let controller = RecordingOutputController::with_backend(Arc::new(output.clone()));
+    controller.begin(1, mute_only());
+    controller.ready(1);
+    original.restore_error.store(true, Ordering::SeqCst);
+    controller.finish_after_capture(1, || ());
+
+    *output.0.lock().unwrap() = replacement.clone();
+    controller.begin(2, mute_only());
+    controller.ready(2);
+    assert!(replacement.muted.load(Ordering::SeqCst));
+    assert_eq!(controller.0.state.lock().unwrap().muted.len(), 2);
+    controller.finish_after_capture(2, || {
+        assert!(original.muted.load(Ordering::SeqCst));
+        assert!(replacement.muted.load(Ordering::SeqCst));
+    });
+    assert!(!replacement.muted.load(Ordering::SeqCst));
+    assert!(original.muted.load(Ordering::SeqCst));
+    assert_eq!(controller.0.state.lock().unwrap().muted.len(), 1);
+
+    original.restore_error.store(false, Ordering::SeqCst);
+    controller.close_after_capture(|| ());
+    assert!(!original.muted.load(Ordering::SeqCst));
+    assert!(!replacement.muted.load(Ordering::SeqCst));
+}
+
+#[test]
+fn returning_to_retained_output_never_restores_into_a_new_capture() {
+    let original = Arc::new(FakeOutput::default());
+    let replacement = Arc::new(FakeOutput::default());
+    let output = SwitchingOutput(Arc::new(Mutex::new(original.clone())));
+    let controller = RecordingOutputController::with_backend(Arc::new(output.clone()));
+    controller.begin(1, mute_only());
+    controller.ready(1);
+    original.restore_error.store(true, Ordering::SeqCst);
+    controller.finish_after_capture(1, || ());
+    *output.0.lock().unwrap() = replacement.clone();
+    controller.begin(2, mute_only());
+    controller.ready(2);
+    controller.finish_after_capture(2, || ());
+
+    *output.0.lock().unwrap() = original.clone();
+    original.restore_error.store(false, Ordering::SeqCst);
+    let attempts = original.restore_calls.load(Ordering::SeqCst);
+    controller.begin(3, mute_only());
+    assert!(original.muted.load(Ordering::SeqCst));
+    controller.ready(3);
+    assert_eq!(original.restore_calls.load(Ordering::SeqCst), attempts);
+    assert_eq!(controller.0.state.lock().unwrap().muted.len(), 1);
+    controller.finish_after_capture(3, || {
+        assert!(original.muted.load(Ordering::SeqCst));
+        assert!(!replacement.muted.load(Ordering::SeqCst));
+    });
+    assert!(!original.muted.load(Ordering::SeqCst));
+    assert_eq!(original.restore_calls.load(Ordering::SeqCst), attempts + 1);
+}
+
+#[test]
+fn pending_restoration_limit_never_creates_an_untracked_mute() {
+    let output = SwitchingOutput(Arc::new(Mutex::new(Arc::new(FakeOutput::default()))));
+    let controller = RecordingOutputController::with_backend(Arc::new(output.clone()));
+    for generation in 1..=MAX_MUTE_LEASES as u64 + 1 {
+        let next = Arc::new(FakeOutput::default());
+        next.restore_error.store(true, Ordering::SeqCst);
+        *output.0.lock().unwrap() = next.clone();
+        controller.begin(generation, mute_only());
+        controller.ready(generation);
+        assert_eq!(
+            next.muted.load(Ordering::SeqCst),
+            generation <= MAX_MUTE_LEASES as u64
+        );
+        controller.finish_after_capture(generation, || ());
+        assert!(controller.0.state.lock().unwrap().muted.len() <= MAX_MUTE_LEASES);
+    }
 }
 
 #[test]

@@ -4,7 +4,9 @@
 Historical RED uses unchanged method bodies from a pinned revision, compiled
 against the explicit fake collaborators in audio_lifecycle_before_fix.rs.
 Current GREEN/mutation checks compile the actual production modules through
-the existing Cargo harness. Neither layer proves audible hardware behavior.
+the existing Cargo harness. A separate production-body runner exercises the
+coordinator, actual Start, no-token Stop and full cancellation boundary.
+None of these layers proves audible hardware behavior.
 Compilation errors, zero matching tests, and timeouts are infrastructure errors,
 not evidence that a regression test detected the intended defect.
 """
@@ -103,9 +105,23 @@ MUTATIONS = (
     {
         "name": "suppress_mute_when_pause_is_enabled",
         "file": "src-tauri/src/managers/recording_output.rs",
-        "before": "if options.mute && state.muted.is_none() {",
-        "after": "if options.mute && !options.pause && state.muted.is_none() {",
+        "before": "if options.mute && state.muted.len() < MAX_MUTE_LEASES {",
+        "after": "if options.mute && !options.pause && state.muted.len() < MAX_MUTE_LEASES {",
         "test": "recording_output::tests::all_four_setting_combinations_are_independent",
+    },
+    {
+        "name": "suppress_new_default_mute_after_unrelated_restore_failure",
+        "file": "src-tauri/src/managers/recording_output.rs",
+        "before": "if options.mute && state.muted.len() < MAX_MUTE_LEASES {",
+        "after": "if options.mute && state.muted.is_empty() {",
+        "test": "recording_output::tests::failed_restore_does_not_disable_new_default_mute",
+    },
+    {
+        "name": "retry_pending_restore_after_capture_start",
+        "file": "src-tauri/src/managers/recording_output.rs",
+        "before": "        self.0.backend.begin(generation);",
+        "after": "        state.restore_mute();\n        self.0.backend.begin(generation);",
+        "test": "recording_output::tests::returning_to_retained_output_never_restores_into_a_new_capture",
     },
     {
         "name": "restore_current_default_instead_of_original_output",
@@ -489,6 +505,26 @@ def current_mutations(cargo: str, evidence: Path) -> dict:
     return result
 
 
+def coordinator_probe(rustc: str, evidence: Path) -> dict:
+    """Include runtime coordination proof in the same small CI artifact."""
+    output = evidence / "coordinator"
+    run(
+        [sys.executable, str(ROOT / "scripts/ci/coordinator_regressions.py"),
+         "--rustc", rustc, "--output", str(output)],
+        ROOT,
+        evidence / "coordinator-runner.log",
+        timeout=600,
+    )
+    runner = dict(run.last_result)
+    if runner["exit_code"] != 0:
+        raise RuntimeError("Coordinator runtime/mutation proof failed; see coordinator-runner.log")
+    receipt = json.loads((output / "receipt.json").read_text())
+    if receipt.get("status") != "all_expected_results_verified":
+        raise RuntimeError("Coordinator receipt did not verify all expected results")
+    print("Coordinator runtime and mutation evidence verified", flush=True)
+    return {"runner": runner, "receipt_path": "coordinator/receipt.json", **receipt}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -514,6 +550,10 @@ def main() -> int:
         if not args.historical_only:
             receipt["wiring"] = current_wiring()
             receipt["current"] = current_mutations(args.cargo, evidence)
+            receipt["coordinator"] = coordinator_probe(args.rustc, evidence)
+            for field in ("checked_commit", "working_tree_dirty"):
+                if receipt["coordinator"][field] != receipt[field]:
+                    raise RuntimeError(f"Repository state changed during coordinator proof: {field}")
         receipt["status"] = "historical_red_verified" if args.historical_only else "all_expected_results_verified"
         return 0
     except (RuntimeError, OSError, subprocess.SubprocessError) as error:
