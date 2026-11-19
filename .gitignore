@@ -29,7 +29,7 @@ dist-ssr
 .claude/
 
 /target/
-recording_*
+/recording_*
 .crush/
 
 # Playwright

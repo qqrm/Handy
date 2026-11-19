@@ -5,12 +5,16 @@ on:
     paths:
       - "src-tauri/**"
       - "scripts/ci/quicktime_probe.py"
+      - "scripts/ci/audio_lifecycle_before_fix.rs"
+      - "scripts/ci/recording_output_regressions.py"
       - ".github/workflows/media-pause-windows.yml"
   push:
     branches: [main]
     paths:
       - "src-tauri/**"
       - "scripts/ci/quicktime_probe.py"
+      - "scripts/ci/audio_lifecycle_before_fix.rs"
+      - "scripts/ci/recording_output_regressions.py"
       - ".github/workflows/media-pause-windows.yml"
   workflow_dispatch:
 
@@ -34,20 +38,38 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+          # The historical RED probe reads its immutable, pre-fix source commit.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable
         with:
           toolchain: stable
           components: clippy, rustfmt
-      - name: Test actual shared controller and platform adapter
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri/tests/media-pause -> target
+          key: recording-output-regressions
+      - name: Test production pause, mute, and recording lifecycle
         run: cargo test --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml
       - name: Lint the platform test harness
         run: cargo clippy --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml --all-targets -- -D warnings
       - name: Check formatting
         if: always() && matrix.platform == 'ubuntu-24.04'
         run: cargo fmt --manifest-path src-tauri/tests/media-pause/Cargo.toml -- --check
+      - name: Prove historical failures and regression-test sensitivity
+        id: regression_evidence
+        if: matrix.platform == 'ubuntu-24.04'
+        run: python3 scripts/ci/recording_output_regressions.py --output "$RUNNER_TEMP/recording-output-evidence"
+      - name: Preserve small regression receipts and assertion logs
+        if: always() && matrix.platform == 'ubuntu-24.04' && steps.regression_evidence.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: recording-output-regression-evidence
+          path: ${{ runner.temp }}/recording-output-evidence
+          if-no-files-found: error
+          retention-days: 14
 
   linux-isolated-mpris:
-    name: Linux isolated MPRIS (VLC and delayed replies)
+    name: Linux isolated media (MPRIS and output mute)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -60,7 +82,7 @@ jobs:
       - name: Install the real fixture player and private message bus
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends dbus vlc-bin vlc-plugin-base
+          sudo apt-get install -y --no-install-recommends dbus vlc-bin vlc-plugin-base pulseaudio pulseaudio-utils
       - name: Run each production-adapter scenario on a fresh private bus
         shell: bash
         run: |
@@ -81,6 +103,24 @@ jobs:
           assert sum(line.startswith("test result: ok. 1 passed; 0 failed; 0 ignored;") for line in lines) == 1, "Expected one actual passing test"
           PY
           done
+      - name: Verify mute restoration on two private PulseAudio outputs
+        env:
+          HANDY_RUN_ISOLATED_OUTPUT_MUTE_TESTS: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          test='output_mute::platform::native_tests::isolated_pulseaudio_mute_restores_original_sink'
+          output="$RUNNER_TEMP/output-mute-native.log"
+          cargo test --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml "$test" \
+            -- --exact --ignored --nocapture --test-threads=1 2>&1 | tee "$output"
+          TEST_NAME="$test" TEST_LOG="$output" python3 - <<'PY'
+          import os
+          from pathlib import Path
+          lines = Path(os.environ["TEST_LOG"]).read_text().splitlines()
+          name = "test " + os.environ["TEST_NAME"] + " ..."
+          assert sum(line.startswith(name) for line in lines) == 1, "Expected exactly one named output-mute test"
+          assert sum(line.startswith("test result: ok. 1 passed; 0 failed; 0 ignored;") for line in lines) == 1, "Expected one actual passing output-mute test"
+          PY
 
   macos-isolated-quicktime:
     name: macOS production QuickTime (${{ matrix.platform }})
@@ -174,8 +214,10 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-      - name: Test production SMTC adapter and recording lifecycle
+      - name: Test production SMTC, endpoint mute, and recording lifecycle
         run: cargo test --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml
+      - name: Lint the Windows production-adapter harness
+        run: cargo clippy --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml --all-targets -- -D warnings
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri -> target

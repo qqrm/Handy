@@ -1,6 +1,7 @@
-# Media pause validation
+# Recording pause and mute validation
 
-The small test crate compiles the **production** controller and its Windows SMTC,
+The small test crate compiles the **production** recording-output controller,
+endpoint-mute adapters, media-pause controller, and its Windows SMTC,
 Linux MPRIS, or macOS QuickTime adapter, without speech-model/GPU SDKs. Full application builds
 remain separate checks. All builds and runtime tests for this change run on
 standard GitHub-hosted VMs in this public fork. Never run the native player
@@ -14,7 +15,9 @@ fixtures on a working desktop or spoof their hosted-environment guards.
   all third-party players, and the cause of historical Explorer hangs.
 - **Linux x64:** production MPRIS against two real VLC processes on a private
   D-Bus; advancing/paused clocks, initially paused player, multiple players,
-  user override, replacement owner, and delayed-reply regression. Excludes
+  user override, replacement owner, and delayed-reply regression. The production
+  PulseAudio mute adapter also runs against two null sinks on a private server,
+  including a changed default output. Excludes
   audible hardware (dummy sink), every desktop/browser, and transcription.
 - **macOS Intel:** production controller and QuickTime adapter regressions and
   actual playback through public Apple Events on a native Intel VM. Application
@@ -31,11 +34,67 @@ The opt-in setting is available on Windows, Linux and macOS, and remains off by
 default. macOS support is explicitly limited to QuickTime Player local files. A passing
 fixture does not extend that support to Music, Spotify, VLC, or browsers.
 
+## Pause + mute regression evidence
+
+SMTC exposes media sessions, not every browser tab or every audio source. Pause
+and mute therefore remain independent options. Pause preserves the position of
+controllable media; mute silences the selected output while other media may
+continue advancing. Neither option claims to stop every browser tab.
+
+The recording-output controller snapshots the two options at the start of a
+capture. A stop request rejects late readiness callbacks, but keeps existing
+pause/mute ownership through the capture tail and actual recorder stop. Stop and
+Cancel share the same cleanup boundary, including when the microphone stays
+open in always-on or lazy-close mode. Cleanup finishes before the manager
+publishes Idle. Delayed work from an older recording cannot mutate a newer one.
+
+Mute ownership records the exact output selected before its state is read or
+changed. Restoration never targets a newly selected default. An already-muted
+or unreadable output is left alone. Failed restoration retains ownership for a
+later cleanup attempt and prevents another mute lease from overwriting it.
+Settings changes affect the next capture; they do not release the current
+capture's protection early.
+
+### Evidence layers
+
+| Layer                 | What is checked                                                                                                                                                                                                                                    | Limit                                                                                                                                   |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| Historical RED        | Unchanged `AudioRecordingManager` method bodies from `bf42308f755749e61b1dbda5bef613d629842d9a` reproduce AlwaysOn/lazy Cancel, early resume into tail capture, stale mute, and default-output retargeting                                         | Recorder, settings, output endpoints, SMTC transport, and lazy timer are explicit fake collaborators; this is not the whole application |
+| Current runtime GREEN | Actual `recording_output.rs` and `output_mute.rs` with deterministic collaborators: all four settings combinations, stop/cancel ordering, delayed readiness, overlapping generations, original mute state, failed restoration, and output identity | Does not open a microphone or render physical audio                                                                                     |
+| Mutation sensitivity  | Each deliberately reintroduced production-code fault must compile, then fail one exact previously-passing regression test                                                                                                                          | A compile error, timeout, skipped test, or zero matches never counts as detecting the fault                                             |
+| Application wiring    | Source contracts check actual Stop/Cancel capture closures, protected tail, coordinator completion, stop-cue order, and Windows endpoint reopening; full application compilation remains mandatory                                                 | Static integration checks are reported separately from runtime controller tests                                                         |
+| Native Linux output   | Actual PulseAudio commands on an isolated server mute one sink, switch the default, and restore only the original sink                                                                                                                             | Null sinks exercise the audio service, not speakers or acoustic microphone pickup                                                       |
+| Native Windows        | Actual SMTC/video-only playback and compilation of the production COM endpoint adapter                                                                                                                                                             | Hosted Windows has no guaranteed audio endpoint; neither audible mute nor switching two physical Windows outputs is claimed             |
+
+Run the complete portable evidence procedure with:
+
+```bash
+python3 scripts/ci/recording_output_regressions.py --output /tmp/handy-recording-output-evidence
+```
+
+The pinned historical commit must be present locally (`git fetch --unshallow`
+when using a shallow clone). The script never mutates the working tree: current
+production sources are copied into a temporary snapshot for mutation checks.
+It records commit IDs, source/method SHA-256 hashes, selected tests, successful
+compilation, and exact assertion outcomes in `receipt.json` with the associated
+logs and extracted historical source. The historical fixture includes two
+passing sanity checks; its five intentional RED assertions are evidence of the
+old faults, not failures of the corrected implementation.
+
+CI runs this procedure once on Ubuntu, alongside ordinary Linux/macOS/Windows
+tests and full Windows application compilation. The small
+`recording-output-regression-evidence` artifact retains receipts and logs for
+14 days; no installer or audio recording is uploaded. Read the receipt's
+`checked_commit`, `working_tree_dirty`, and `status` before using it as evidence.
+The repository contains the procedure so the proof can be regenerated after
+artifact expiry. A green historical-only receipt does **not** establish current
+behavior: the full receipt must say `all_expected_results_verified`.
+
 ## Controller behavior
 
-Only sessions playing at recording readiness are paused. Stop, cancellation,
-disabling the setting, and superseding recordings retire the same session's
-lease. A successful method reply is insufficient: the controller also requires
+Only sessions playing at recording readiness are paused. Capture completion,
+cancellation cleanup, and stream shutdown retire the same session's lease;
+changing an option affects the next capture. A successful method reply is insufficient: the controller also requires
 the playback transition. Late Pause and Play operations retain their original
 object, observer, and pending result; a new recording cannot overlap them.
 
