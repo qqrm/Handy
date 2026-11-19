@@ -747,8 +747,11 @@ def main():
         production = rust_target / "debug/libhandy_media_pause_tests.a"
         if not production.is_file():
             raise SystemExit("Actual production controller fixture archive was not built")
+        # The manual static-library link must include the output mute adapter's
+        # frameworks; Rust's #[link] metadata is not carried by the .a archive.
         run(["/usr/bin/xcrun", "clang", "-fobjc-arc", "-Wall", "-Wextra",
-             "-framework", "Cocoa", "-framework", "ApplicationServices", "-framework", "CoreServices", str(source),
+             "-framework", "Cocoa", "-framework", "ApplicationServices", "-framework", "CoreServices",
+             "-framework", "CoreAudio", "-framework", "CoreFoundation", str(source),
              str(production),
              "-o", str(binary)], timeout=120)
         run(["/usr/bin/codesign", "--force", "--sign", "-", "--options", "runtime",
