@@ -50,7 +50,8 @@ impl Drop for FinishGuard {
 
 // Shortcut Action Trait
 pub trait ShortcutAction: Send + Sync {
-    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str);
+    /// Returns whether this call started a recording.
+    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) -> bool;
     fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str);
 }
 
@@ -467,7 +468,7 @@ pub(crate) async fn process_transcription_output(
 }
 
 impl ShortcutAction for TranscribeAction {
-    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) -> bool {
         let start_time = Instant::now();
         debug!("TranscribeAction::start called for binding: {}", binding_id);
 
@@ -495,7 +496,7 @@ impl ShortcutAction for TranscribeAction {
                 .get_model_path(&selected_model)
             {
                 warn!("Not starting recording: no model can transcribe it ({})", e);
-                return;
+                return false;
             }
         }
 
@@ -600,8 +601,7 @@ impl ShortcutAction for TranscribeAction {
                         play_feedback_sound_blocking(&app_clone, SoundType::Start);
                     }
                     if rm_clone.is_recording_readiness_current(generation) {
-                        rm_clone.apply_mute();
-                        rm_clone.apply_media_pause(generation);
+                        rm_clone.apply_recording_output(generation);
                     }
                 });
             }
@@ -611,7 +611,8 @@ impl ShortcutAction for TranscribeAction {
             }
         }
 
-        if recording_error.is_none() {
+        let started = recording_error.is_none();
+        if started {
             // Dynamically register the cancel shortcut in a separate task to avoid deadlock
             shortcut::register_cancel_shortcut(app);
         } else {
@@ -642,13 +643,24 @@ impl ShortcutAction for TranscribeAction {
             "TranscribeAction::start completed in {:?}",
             start_time.elapsed()
         );
+        started
     }
 
     fn stop(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+        // The coordinator has already entered Processing. Cancellation can
+        // remove the recording before we obtain its token, so even that early
+        // return must signal pipeline completion. The coordinator also waits
+        // for the entire cancellation worker before accepting another start.
+        let tm = Arc::clone(&app.state::<Arc<TranscriptionManager>>());
+        let finish = FinishGuard(app.clone(), Arc::clone(&tm));
         // Prevent a slow microphone from emitting a ready event or start chime
         // after the user has already requested stop.
-        app.state::<Arc<AudioRecordingManager>>()
-            .invalidate_recording_readiness();
+        let Some(generation) = app
+            .state::<Arc<AudioRecordingManager>>()
+            .request_recording_stop(binding_id)
+        else {
+            return;
+        };
 
         // Unregister the cancel shortcut when transcription stops
         shortcut::unregister_cancel_shortcut(app);
@@ -658,7 +670,6 @@ impl ShortcutAction for TranscribeAction {
 
         let ah = app.clone();
         let rm = Arc::clone(&app.state::<Arc<AudioRecordingManager>>());
-        let tm = Arc::clone(&app.state::<Arc<TranscriptionManager>>());
         let hm = Arc::clone(&app.state::<Arc<HistoryManager>>());
 
         set_tray_state(app, TrayIconState::Transcribing);
@@ -676,27 +687,19 @@ impl ShortcutAction for TranscribeAction {
             show_transcribing_overlay(app);
         }
 
-        // Unmute before playing audio feedback so the stop sound is audible
-        rm.remove_mute();
-        // Resume media we paused for the recording, mirroring the unmute above.
-        rm.remove_media_pause();
-
-        // Play audio feedback for recording stop
-        play_feedback_sound(app, SoundType::Stop);
-
         let binding_id = binding_id.to_string(); // Clone binding_id for the async task
         let post_process = self.post_process;
         let cancel_generation = rm.cancel_generation();
 
         tauri::async_runtime::spawn(async move {
-            let _guard = FinishGuard(ah.clone(), Arc::clone(&tm));
+            let _guard = finish;
             debug!(
                 "Starting async transcription task for binding: {}",
                 binding_id
             );
 
             let stop_recording_time = Instant::now();
-            if let Some(samples) = rm.stop_recording(&binding_id, cancel_generation) {
+            if let Some(samples) = rm.stop_recording(&binding_id, generation, cancel_generation) {
                 debug!(
                     "Recording stopped and samples retrieved in {:?}, sample count: {}",
                     stop_recording_time.elapsed(),
@@ -710,6 +713,10 @@ impl ShortcutAction for TranscribeAction {
                     set_tray_state(&ah, TrayIconState::Idle);
                     return;
                 }
+
+                // Capture (including its tail) has ended and mute is restored.
+                // Never feed the stop cue or resumed media into the recording.
+                play_feedback_sound(&ah, SoundType::Stop);
 
                 if samples.is_empty() {
                     debug!("Recording produced no audio samples; skipping persistence");
@@ -910,8 +917,9 @@ impl ShortcutAction for TranscribeAction {
 struct CancelAction;
 
 impl ShortcutAction for CancelAction {
-    fn start(&self, app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
+    fn start(&self, app: &AppHandle, _binding_id: &str, _shortcut_str: &str) -> bool {
         utils::cancel_current_operation(app);
+        false
     }
 
     fn stop(&self, _app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
@@ -923,13 +931,14 @@ impl ShortcutAction for CancelAction {
 struct TestAction;
 
 impl ShortcutAction for TestAction {
-    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) {
+    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) -> bool {
         log::info!(
             "Shortcut ID '{}': Started - {} (App: {})", // Changed "Pressed" to "Started" for consistency
             binding_id,
             shortcut_str,
             app.package_info().name
         );
+        false
     }
 
     fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) {
