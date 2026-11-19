@@ -238,12 +238,13 @@ jobs:
         shell: pwsh
         run: |
           $archive = Join-Path $env:RUNNER_TEMP 'ort-1.24.2.zip'
-          Invoke-WebRequest 'https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-x64-1.24.2.zip' -OutFile $archive
-          $expected = '8e3e9c826375352e29cb2614fe44f3d7a4b0ff7b8028ad7a456af9d949a7e8b0'
+          # Microsoft's CPU package; bytes verified against NuGet's catalog SHA-512.
+          Invoke-WebRequest 'https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.24.2/microsoft.ml.onnxruntime.1.24.2.nupkg' -OutFile $archive
+          $expected = '782564d3d68e87269ea1812cc94710ad06fe014faf093f01a6f89d0bd58719d3'
           if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'ONNX Runtime checksum mismatch' }
           $destination = Join-Path $env:RUNNER_TEMP 'ort-1.24.2'
           Expand-Archive $archive -DestinationPath $destination
-          Add-Content $env:GITHUB_ENV "ORT_LIB_LOCATION=$destination/onnxruntime-win-x64-1.24.2/lib"
+          Add-Content $env:GITHUB_ENV "ORT_LIB_LOCATION=$destination/runtimes/win-x64/native"
           Add-Content $env:GITHUB_ENV 'ORT_PREFER_DYNAMIC_LINK=1'
       - name: Compile and lint all Windows application targets
         working-directory: src-tauri
