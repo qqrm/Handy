@@ -230,11 +230,11 @@
       },
       "pauseWhileRecording": {
         "label": "Pause While Recording",
-        "description": "Pause media playback while recording"
+        "description": "Pause supported media playback. Windows may expose only one active browser tab; combine this with Mute While Recording to silence other audio on the default output. Changes apply from the next recording."
       },
       "playAfterRecording": {
         "label": "Resume After Recording",
-        "description": "Resume media playback if Handy paused it"
+        "description": "Resume playback that Handy paused when recording ends. Turn this off to leave it paused. Changes apply from the next recording."
       },
       "outputDevice": {
         "title": "Output Device",
@@ -515,7 +515,7 @@
       },
       "muteWhileRecording": {
         "label": "Mute While Recording",
-        "description": "Mute system audio during recording"
+        "description": "Mute the current default output during recording, then restore only the output Handy changed. Changes apply from the next recording."
       },
       "appendTrailingSpace": {
         "label": "Append Trailing Space",

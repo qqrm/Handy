@@ -179,6 +179,12 @@ tempfile = "3"
 # resumable HTTP downloader; normal builds keep the leaner feature set.
 tokio = { version = "1.43.0", features = ["macros", "net", "io-util", "sync", "time", "rt-multi-thread"] }
 
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.61.3", features = [
+  "Media_Playback", "Media_Core", "Media_Editing", "Media_MediaProperties",
+  "UI", "Win32_UI_Shell",
+] }
+
 [profile.release]
 lto = true
 codegen-units = 1

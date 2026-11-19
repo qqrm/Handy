@@ -1,10 +1,11 @@
-// This harness imports production modules directly; it does not copy their logic.
-// Public adapter entry points are compiled but require live players to execute.
+// Compile the production media, output and lifecycle modules directly.
 #![allow(dead_code)]
 
-#[path = "../../src/media_control_windows_batch.rs"]
-mod windows_batch;
-
-#[cfg(target_os = "windows")]
-#[path = "../../src/media_control_windows.rs"]
-mod platform_windows;
+#[path = "../../src/coordinator_cleanup.rs"]
+mod coordinator_cleanup;
+#[path = "../../src/media_control.rs"]
+mod media_control;
+#[path = "../../src/managers/output_mute.rs"]
+mod output_mute;
+#[path = "../../src/managers/recording_output.rs"]
+mod recording_output;

@@ -1,6 +1,5 @@
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::transcription::TranscriptionManager;
-use crate::media_control::MediaControlManager;
 use crate::shortcut;
 use crate::TranscriptionCoordinator;
 use log::info;
@@ -72,9 +71,20 @@ fn native_windows_machine() -> Option<u16> {
     }
 }
 
+/// Queue cancellation so its full capture, stream and UI cleanup is serialized
+/// with new starts by the transcription coordinator.
+pub fn cancel_current_operation(app: &AppHandle) {
+    if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
+        coordinator.cancel();
+    } else {
+        let app = app.clone();
+        std::thread::spawn(move || finish_cancellation(&app));
+    }
+}
+
 /// Centralized cancellation function that can be called from anywhere in the app.
 /// Handles cancelling both recording and transcription operations and updates UI state.
-pub fn cancel_current_operation(app: &AppHandle) {
+pub(crate) fn finish_cancellation(app: &AppHandle) {
     info!("Initiating operation cancellation...");
 
     // Unregister the cancel shortcut asynchronously
@@ -82,17 +92,11 @@ pub fn cancel_current_operation(app: &AppHandle) {
 
     // Cancel any ongoing recording
     let audio_manager = app.state::<Arc<AudioRecordingManager>>();
-    let recording_was_active = audio_manager.is_recording();
     audio_manager.cancel_recording();
 
     // Abandon any live streaming transcription
     let tm = app.state::<Arc<TranscriptionManager>>();
     tm.cancel_stream();
-
-    let media_control_manager = app.state::<Arc<MediaControlManager>>();
-    // resume_after_recording() also invalidates any in-flight pause attempt, so cancellation
-    // cannot leave stale paused-playback state behind if recording stops before the pause thread finishes.
-    media_control_manager.resume_after_recording(app);
 
     // Update tray icon and hide overlay
     change_tray_icon(app, crate::tray::TrayIconState::Idle);
@@ -100,11 +104,6 @@ pub fn cancel_current_operation(app: &AppHandle) {
 
     // Unload model if immediate unload is enabled
     tm.maybe_unload_immediately("cancellation");
-
-    // Notify coordinator so it can keep lifecycle state coherent.
-    if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
-        coordinator.notify_cancel(recording_was_active);
-    }
 
     info!("Operation cancellation completed - returned to idle state");
 }

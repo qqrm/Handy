@@ -19,49 +19,42 @@ pub(super) trait MediaSession {
     fn try_play(&self) -> Result<bool, String>;
 }
 
-pub(super) fn pause_sessions(sessions: &[impl MediaSession]) -> Vec<String> {
-    let mut paused_ids = Vec::new();
+/// Retain each concrete session that accepted Pause. App IDs are metadata,
+/// never an ownership key: one app may publish several different sessions.
+pub(super) fn pause_sessions<S: MediaSession + Clone>(sessions: &[S]) -> Vec<S> {
+    let mut paused = Vec::new();
     for session in sessions {
         match pause_session(session) {
-            Ok(Some(id)) => {
-                if !paused_ids.contains(&id) {
-                    paused_ids.push(id);
-                }
-            }
+            Ok(Some(session)) => paused.push(session),
             Ok(None) => {}
-            Err(err) => debug!("Skipping Windows media pause: {err}"),
+            Err(error) => debug!("Skipping Windows media pause: {error}"),
         }
     }
-    // Once any session has been paused, later failures must never discard its ID.
-    paused_ids
+    paused
 }
 
-fn pause_session(session: &impl MediaSession) -> Result<Option<String>, String> {
+fn pause_session<S: MediaSession + Clone>(session: &S) -> Result<Option<S>, String> {
     if session.playback_status()? != Some(PlaybackStatus::Playing) || !session.pause_enabled()? {
         return Ok(None);
     }
-
-    // Resolve everything needed for resume BEFORE the first side effect. There
-    // must be no fallible lookup between a successful pause and returning its ID.
-    let Some(id) = session.source_app_id()?.filter(|id| !id.is_empty()) else {
+    // Keep the legacy metadata check, but capture the actual handle before any
+    // side effect. No later lookup or app-ID collision can lose its ownership.
+    if session.source_app_id()?.is_none_or(|id| id.is_empty()) {
         return Ok(None);
-    };
-    Ok(session.try_pause()?.then_some(id))
+    }
+    let owned = session.clone();
+    Ok(session.try_pause()?.then_some(owned))
 }
 
-pub(super) fn resume_sessions(
-    sessions: &[impl MediaSession],
-    paused_ids: &[String],
-) -> Result<(), String> {
+/// Restore only the same handles that accepted Pause; never enumerate replacements.
+pub(super) fn resume_sessions(paused: &[impl MediaSession]) -> Result<(), String> {
     let mut errors = Vec::new();
-    for session in sessions {
-        if let Err(err) = resume_session(session, paused_ids) {
-            debug!("Failed to resume Windows media session: {err}");
-            errors.push(err);
+    for session in paused {
+        if let Err(error) = resume_session(session) {
+            debug!("Failed to resume Windows media session: {error}");
+            errors.push(error);
         }
     }
-
-    // Report failures only after every other session has had a chance to resume.
     if errors.is_empty() {
         Ok(())
     } else {
@@ -69,19 +62,12 @@ pub(super) fn resume_sessions(
     }
 }
 
-fn resume_session(session: &impl MediaSession, paused_ids: &[String]) -> Result<(), String> {
-    let Some(id) = session.source_app_id()? else {
-        return Ok(());
-    };
-    if !paused_ids.contains(&id)
-        || session.playback_status()? != Some(PlaybackStatus::Paused)
-        || !session.play_enabled()?
-    {
+fn resume_session(session: &impl MediaSession) -> Result<(), String> {
+    if session.playback_status()? != Some(PlaybackStatus::Paused) || !session.play_enabled()? {
         return Ok(());
     }
-
     if !session.try_play()? {
-        debug!("Windows media session '{id}' declined the play request; ignoring");
+        debug!("Owned Windows media session declined the play request; ignoring");
     }
     Ok(())
 }
@@ -90,37 +76,39 @@ fn resume_session(session: &impl MediaSession, paused_ids: &[String]) -> Result<
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
 
+    #[derive(Clone)]
     struct TestSession {
         id: Result<Option<String>, String>,
-        status: Cell<Option<PlaybackStatus>>,
-        failure: Option<&'static str>,
+        status: Rc<Cell<Option<PlaybackStatus>>>,
+        failure: Rc<Cell<Option<&'static str>>>,
         pause_enabled: bool,
         play_enabled: bool,
         pause_accepted: bool,
         play_accepted: bool,
         lose_id_after_pause: bool,
-        calls: RefCell<Vec<&'static str>>,
+        calls: Rc<RefCell<Vec<&'static str>>>,
     }
 
     impl TestSession {
         fn playing(id: &str) -> Self {
             Self {
                 id: Ok(Some(id.to_string())),
-                status: Cell::new(Some(PlaybackStatus::Playing)),
-                failure: None,
+                status: Rc::new(Cell::new(Some(PlaybackStatus::Playing))),
+                failure: Rc::new(Cell::new(None)),
                 pause_enabled: true,
                 play_enabled: true,
                 pause_accepted: true,
                 play_accepted: true,
                 lose_id_after_pause: false,
-                calls: RefCell::new(Vec::new()),
+                calls: Rc::new(RefCell::new(Vec::new())),
             }
         }
 
         fn call(&self, operation: &'static str) -> Result<(), String> {
             self.calls.borrow_mut().push(operation);
-            if self.failure == Some(operation) {
+            if self.failure.get() == Some(operation) {
                 Err(format!("{operation} failed"))
             } else {
                 Ok(())
@@ -134,6 +122,13 @@ mod tests {
                 .filter(|&&call| call == operation)
                 .count()
         }
+    }
+
+    fn ids(sessions: &[TestSession]) -> Vec<String> {
+        sessions
+            .iter()
+            .map(|session| session.id.as_ref().unwrap().clone().unwrap())
+            .collect()
     }
 
     impl MediaSession for TestSession {
@@ -200,7 +195,10 @@ mod tests {
             lose_id_after_pause: true,
             ..TestSession::playing("player")
         };
-        assert_eq!(pause_sessions(std::slice::from_ref(&session)), ["player"]);
+        assert_eq!(
+            ids(&pause_sessions(std::slice::from_ref(&session))),
+            ["player"]
+        );
         assert_eq!(
             *session.calls.borrow(),
             ["status", "pause_enabled", "id", "pause"]
@@ -213,15 +211,15 @@ mod tests {
             let sessions = [
                 TestSession::playing("first"),
                 TestSession {
-                    failure: Some(operation),
+                    failure: Rc::new(Cell::new(Some(operation))),
                     ..TestSession::playing("broken")
                 },
                 TestSession::playing("last"),
             ];
             let paused = pause_sessions(&sessions);
-            assert_eq!(paused, ["first", "last"], "failure in {operation}");
+            assert_eq!(ids(&paused), ["first", "last"], "failure in {operation}");
             // Exercise the real recovery policy with the actual partial result.
-            let _ = resume_sessions(&sessions, &paused);
+            let _ = resume_sessions(&paused);
             for index in [0, 2] {
                 assert_eq!(
                     sessions[index].calls_to("play"),
@@ -243,12 +241,12 @@ mod tests {
                 ..TestSession::playing("missing-id")
             },
             TestSession {
-                status: Cell::new(None),
+                status: Rc::new(Cell::new(None)),
                 ..TestSession::playing("missing-info")
             },
             TestSession::playing("last"),
         ];
-        assert_eq!(pause_sessions(&sessions), ["first", "last"]);
+        assert_eq!(ids(&pause_sessions(&sessions)), ["first", "last"]);
         assert_eq!(sessions[1].calls_to("pause"), 0);
         assert_eq!(sessions[2].calls_to("pause"), 0);
     }
@@ -258,7 +256,7 @@ mod tests {
         let sessions = [
             TestSession::playing("paused-by-us"),
             TestSession {
-                status: Cell::new(Some(PlaybackStatus::Paused)),
+                status: Rc::new(Cell::new(Some(PlaybackStatus::Paused))),
                 ..TestSession::playing("already-paused")
             },
             TestSession {
@@ -271,13 +269,13 @@ mod tests {
             },
         ];
         let paused = pause_sessions(&sessions);
-        assert_eq!(paused, ["paused-by-us"]);
+        assert_eq!(ids(&paused), ["paused-by-us"]);
         // Even if a rejected/unsupported player is later paused by the user,
         // Handy must not start it when the recording ends.
         for session in &sessions {
             session.status.set(Some(PlaybackStatus::Paused));
         }
-        resume_sessions(&sessions, &paused).unwrap();
+        resume_sessions(&paused).unwrap();
         assert_eq!(sessions[0].calls_to("play"), 1);
         for session in &sessions[1..] {
             assert_eq!(session.calls_to("play"), 0);
@@ -285,14 +283,14 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_app_ids_are_returned_once() {
+    fn same_app_sessions_are_owned_individually() {
         let sessions = [
             TestSession::playing("same-app"),
             TestSession::playing("same-app"),
         ];
         let paused = pause_sessions(&sessions);
-        assert_eq!(paused, ["same-app"]);
-        resume_sessions(&sessions, &paused).unwrap();
+        assert_eq!(ids(&paused), ["same-app", "same-app"]);
+        resume_sessions(&paused).unwrap();
         for session in &sessions {
             assert_eq!(session.calls_to("pause"), 1);
             assert_eq!(session.calls_to("play"), 1);
@@ -301,11 +299,11 @@ mod tests {
 
     #[test]
     fn resume_attempts_remaining_sessions_before_reporting_errors() {
-        for operation in ["id", "status", "play_enabled", "play"] {
-            let mut sessions = [TestSession::playing("first"), TestSession::playing("last")];
+        for operation in ["status", "play_enabled", "play"] {
+            let sessions = [TestSession::playing("first"), TestSession::playing("last")];
             let paused = pause_sessions(&sessions);
-            sessions[0].failure = Some(operation);
-            let error = resume_sessions(&sessions, &paused).unwrap_err();
+            sessions[0].failure.set(Some(operation));
+            let error = resume_sessions(&paused).unwrap_err();
             assert!(error.contains(operation));
             assert_eq!(sessions[1].calls_to("play"), 1, "failure in {operation}");
             assert_eq!(sessions[1].status.get(), Some(PlaybackStatus::Playing));
@@ -313,45 +311,67 @@ mod tests {
     }
 
     #[test]
-    fn resume_does_not_start_untracked_playing_stopped_or_unavailable_sessions() {
+    fn resume_does_not_start_playing_stopped_unavailable_or_play_disabled_owners() {
         let sessions = [
-            TestSession {
-                status: Cell::new(Some(PlaybackStatus::Paused)),
-                ..TestSession::playing("untracked")
-            },
             TestSession::playing("already-playing"),
+            TestSession::playing("stopped"),
+            TestSession::playing("missing-info"),
             TestSession {
-                status: Cell::new(Some(PlaybackStatus::Other)),
-                ..TestSession::playing("stopped")
-            },
-            TestSession {
-                status: Cell::new(None),
-                ..TestSession::playing("missing-info")
-            },
-            TestSession {
-                id: Ok(None),
-                ..TestSession::playing("missing-id")
-            },
-            TestSession {
-                status: Cell::new(Some(PlaybackStatus::Paused)),
                 play_enabled: false,
                 ..TestSession::playing("play-disabled")
             },
         ];
-        let ids = [
-            "already-playing",
-            "stopped",
-            "missing-info",
-            "missing-id",
-            "play-disabled",
-            "exited",
-        ]
-        .map(String::from);
-        resume_sessions(&sessions, &ids).unwrap();
+        let paused = pause_sessions(&sessions);
+        sessions[0].status.set(Some(PlaybackStatus::Playing));
+        sessions[1].status.set(Some(PlaybackStatus::Other));
+        sessions[2].status.set(None);
+        resume_sessions(&paused).unwrap();
         for session in &sessions {
             assert_eq!(session.calls_to("play"), 0);
         }
-        assert_eq!(sessions[0].calls_to("status"), 0);
+    }
+
+    #[test]
+    fn prepaused_sibling_with_same_app_id_is_not_resumed() {
+        let sessions = [
+            TestSession::playing("same-app"),
+            TestSession {
+                status: Rc::new(Cell::new(Some(PlaybackStatus::Paused))),
+                ..TestSession::playing("same-app")
+            },
+        ];
+        let paused = pause_sessions(&sessions);
+        assert_eq!(paused.len(), 1);
+        resume_sessions(&paused).unwrap();
+        assert_eq!(sessions[0].calls_to("play"), 1);
+        assert_eq!(sessions[1].calls_to("play"), 0);
+    }
+
+    #[test]
+    fn replacement_with_same_app_id_cannot_inherit_pause_ownership() {
+        let original = TestSession::playing("same-app");
+        let paused = pause_sessions(std::slice::from_ref(&original));
+        original.status.set(None); // The owned session disappears.
+        let replacement = TestSession {
+            status: Rc::new(Cell::new(Some(PlaybackStatus::Paused))),
+            ..TestSession::playing("same-app")
+        };
+        resume_sessions(&paused).unwrap();
+        assert_eq!(original.calls_to("play"), 0);
+        assert_eq!(replacement.calls_to("play"), 0);
+        assert_eq!(replacement.status.get(), Some(PlaybackStatus::Paused));
+    }
+
+    #[test]
+    fn recovery_does_not_need_app_metadata_after_successful_pause() {
+        let session = TestSession {
+            lose_id_after_pause: true,
+            ..TestSession::playing("player")
+        };
+        let paused = pause_sessions(std::slice::from_ref(&session));
+        resume_sessions(&paused).unwrap();
+        assert_eq!(session.calls_to("id"), 1);
+        assert_eq!(session.calls_to("play"), 1);
     }
 
     #[test]
@@ -364,7 +384,7 @@ mod tests {
             TestSession::playing("last"),
         ];
         let paused = pause_sessions(&sessions);
-        resume_sessions(&sessions, &paused).unwrap();
+        resume_sessions(&paused).unwrap();
         assert_eq!(sessions[0].status.get(), Some(PlaybackStatus::Paused));
         assert_eq!(sessions[1].status.get(), Some(PlaybackStatus::Playing));
     }

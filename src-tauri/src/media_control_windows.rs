@@ -8,12 +8,12 @@ use windows::Media::Control::{
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
 
-struct WinRtGuard {
+pub(super) struct WinRtGuard {
     should_uninitialize: bool,
 }
 
 impl WinRtGuard {
-    fn initialize() -> Result<Self, String> {
+    pub(super) fn initialize() -> Result<Self, String> {
         match unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
             Ok(()) => Ok(Self {
                 should_uninitialize: true,
@@ -37,24 +37,20 @@ impl Drop for WinRtGuard {
 /// Pauses playing sessions that expose a usable source app ID. Per-session
 /// failures are skipped; every successful pause is returned for later resume.
 /// Setup errors can only be returned before any pause has been attempted.
-pub fn pause_active_sessions() -> Result<Vec<String>, String> {
+pub(super) type PausedSessions = Vec<GlobalSystemMediaTransportControlsSession>;
+
+pub fn pause_active_sessions() -> Result<PausedSessions, String> {
     let _guard = WinRtGuard::initialize()?;
     let manager = request_manager()?;
     let sessions = enumerate_sessions(&manager)?;
     Ok(windows_batch::pause_sessions(&sessions))
 }
 
-/// Attempts to resume every tracked source app that is still paused. Errors
-/// from individual sessions are reported after the remaining sessions are tried.
-/// Already-playing, stopped, closed, and untracked sessions are left alone.
-pub fn resume_sessions(source_app_user_model_ids: &[String]) -> Result<(), String> {
-    if source_app_user_model_ids.is_empty() {
-        return Ok(());
-    }
+/// Attempts to resume only the concrete sessions that accepted Pause.
+/// A replacement session or prepaused sibling cannot inherit an app ID's lease.
+pub fn resume_sessions(paused: PausedSessions) -> Result<(), String> {
     let _guard = WinRtGuard::initialize()?;
-    let manager = request_manager()?;
-    let sessions = enumerate_sessions(&manager)?;
-    windows_batch::resume_sessions(&sessions, source_app_user_model_ids)
+    windows_batch::resume_sessions(&paused)
 }
 
 impl MediaSession for GlobalSystemMediaTransportControlsSession {
@@ -169,3 +165,7 @@ fn session_source_app_user_model_id(
 fn session_missing_error(code: HRESULT) -> bool {
     code == HRESULT(0x80070490u32 as i32) || code == HRESULT(0x80004005u32 as i32)
 }
+
+#[cfg(test)]
+#[path = "media_control_windows_test.rs"]
+mod native_test;

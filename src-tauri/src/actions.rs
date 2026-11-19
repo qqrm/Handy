@@ -7,7 +7,6 @@ use crate::managers::history::HistoryManager;
 use crate::managers::model::ModelManager;
 use crate::managers::transcription::StreamWorkKind;
 use crate::managers::transcription::TranscriptionManager;
-use crate::media_control::MediaControlManager;
 use crate::settings::{get_settings, AppSettings, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID};
 use crate::shortcut;
 use crate::tray::{change_tray_icon, TrayIconState};
@@ -46,7 +45,7 @@ impl Drop for FinishGuard {
 
 // Shortcut Action Trait
 pub trait ShortcutAction: Send + Sync {
-    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str);
+    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) -> bool;
     fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str);
 }
 
@@ -462,7 +461,7 @@ pub(crate) async fn process_transcription_output(
 }
 
 impl ShortcutAction for TranscribeAction {
-    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) -> bool {
         let start_time = Instant::now();
         debug!("TranscribeAction::start called for binding: {}", binding_id);
 
@@ -485,8 +484,6 @@ impl ShortcutAction for TranscribeAction {
         let tray_started = Instant::now();
         change_tray_icon(app, TrayIconState::Recording);
         let tray_elapsed = tray_started.elapsed();
-
-        let media_control = app.state::<Arc<MediaControlManager>>();
 
         // Get the microphone mode to determine audio feedback timing
         let plan_started = Instant::now();
@@ -541,16 +538,15 @@ impl ShortcutAction for TranscribeAction {
             debug!("Always-on mode: Starting recording before audio feedback");
             let recording_result = rm.try_start_recording(&binding_id, vad_policy);
             match recording_result {
-                Ok(()) => {
+                Ok(generation) => {
                     let rm_clone = Arc::clone(&rm);
-                    let media_control_clone = Arc::clone(&media_control);
                     let app_clone = app.clone();
                     std::thread::spawn(move || {
-                        // Pause external playback before Handy's start sound so quick recordings
-                        // do not capture extra audio from a media app that is about to be paused.
-                        media_control_clone.pause_for_recording(&app_clone);
+                        if !rm_clone.is_recording_readiness_current(generation) {
+                            return;
+                        }
                         play_feedback_sound_blocking(&app_clone, SoundType::Start);
-                        rm_clone.apply_mute();
+                        rm_clone.apply_recording_output(generation);
                     });
                 }
                 Err(e) => {
@@ -564,18 +560,17 @@ impl ShortcutAction for TranscribeAction {
             let recording_start_time = Instant::now();
             let recording_result = rm.try_start_recording(&binding_id, vad_policy);
             match recording_result {
-                Ok(()) => {
+                Ok(generation) => {
                     debug!("Recording started in {:?}", recording_start_time.elapsed());
                     let app_clone = app.clone();
                     let rm_clone = Arc::clone(&rm);
-                    let media_control_clone = Arc::clone(&media_control);
                     std::thread::spawn(move || {
                         debug!("Handling delayed audio feedback sequence");
-                        // Re-check recording state inside pause_for_recording so rapid start/stop
-                        // and cancellation paths cannot leave playback paused after recording ended.
-                        media_control_clone.pause_for_recording(&app_clone);
+                        if !rm_clone.is_recording_readiness_current(generation) {
+                            return;
+                        }
                         play_feedback_sound_blocking(&app_clone, SoundType::Start);
-                        rm_clone.apply_mute();
+                        rm_clone.apply_recording_output(generation);
                     });
                 }
                 Err(e) => {
@@ -617,6 +612,7 @@ impl ShortcutAction for TranscribeAction {
             "TranscribeAction::start completed in {:?}",
             start_time.elapsed()
         );
+        recording_started
     }
 
     fn stop(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
@@ -630,7 +626,10 @@ impl ShortcutAction for TranscribeAction {
         let rm = Arc::clone(&app.state::<Arc<AudioRecordingManager>>());
         let tm = Arc::clone(&app.state::<Arc<TranscriptionManager>>());
         let hm = Arc::clone(&app.state::<Arc<HistoryManager>>());
-        let media_control = Arc::clone(&app.state::<Arc<MediaControlManager>>());
+        let finish_guard = FinishGuard(ah.clone());
+        let Some(generation) = rm.request_recording_stop(binding_id) else {
+            return;
+        };
 
         change_tray_icon(app, TrayIconState::Transcribing);
         // Stop should give immediate visual feedback. Live streaming can keep
@@ -647,29 +646,19 @@ impl ShortcutAction for TranscribeAction {
             show_transcribing_overlay(app);
         }
 
-        // Resume media after Handy's stop sound so the sound remains audible.
-        rm.remove_mute();
-        {
-            let app_clone = app.clone();
-            std::thread::spawn(move || {
-                play_feedback_sound_blocking(&app_clone, SoundType::Stop);
-                media_control.resume_after_recording(&app_clone);
-            });
-        }
-
         let binding_id = binding_id.to_string(); // Clone binding_id for the async task
         let post_process = self.post_process;
         let cancel_generation = rm.cancel_generation();
 
         tauri::async_runtime::spawn(async move {
-            let _guard = FinishGuard(ah.clone());
+            let _guard = finish_guard;
             debug!(
                 "Starting async transcription task for binding: {}",
                 binding_id
             );
 
             let stop_recording_time = Instant::now();
-            if let Some(samples) = rm.stop_recording(&binding_id, cancel_generation) {
+            if let Some(samples) = rm.stop_recording(&binding_id, generation, cancel_generation) {
                 debug!(
                     "Recording stopped and samples retrieved in {:?}, sample count: {}",
                     stop_recording_time.elapsed(),
@@ -683,6 +672,11 @@ impl ShortcutAction for TranscribeAction {
                     change_tray_icon(&ah, TrayIconState::Idle);
                     return;
                 }
+
+                let feedback_app = ah.clone();
+                std::thread::spawn(move || {
+                    play_feedback_sound_blocking(&feedback_app, SoundType::Stop);
+                });
 
                 if samples.is_empty() {
                     debug!("Recording produced no audio samples; skipping persistence");
@@ -883,8 +877,9 @@ impl ShortcutAction for TranscribeAction {
 struct CancelAction;
 
 impl ShortcutAction for CancelAction {
-    fn start(&self, app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
+    fn start(&self, app: &AppHandle, _binding_id: &str, _shortcut_str: &str) -> bool {
         utils::cancel_current_operation(app);
+        false
     }
 
     fn stop(&self, _app: &AppHandle, _binding_id: &str, _shortcut_str: &str) {
@@ -896,13 +891,14 @@ impl ShortcutAction for CancelAction {
 struct TestAction;
 
 impl ShortcutAction for TestAction {
-    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) {
+    fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) -> bool {
         log::info!(
             "Shortcut ID '{}': Started - {} (App: {})", // Changed "Pressed" to "Started" for consistency
             binding_id,
             shortcut_str,
             app.package_info().name
         );
+        false
     }
 
     fn stop(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str) {

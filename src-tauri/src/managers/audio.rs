@@ -1,3 +1,4 @@
+use super::recording_output::{OutputOptions, RecordingOutputController};
 use crate::audio_toolkit::{
     list_input_devices,
     vad::{
@@ -20,216 +21,6 @@ use tauri::Manager;
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const VAD_THRESHOLD: f32 = 0.3;
 
-fn set_mute(mute: bool) {
-    // Expected behavior:
-    // - Windows: works on most systems using standard audio drivers.
-    // - Linux: works on many systems (PipeWire, PulseAudio, ALSA),
-    //   but some distros may lack the tools used.
-    // - macOS: works on most standard setups via AppleScript.
-    // If unsupported, fails silently.
-
-    #[cfg(target_os = "windows")]
-    {
-        unsafe {
-            use windows::Win32::{
-                Media::Audio::{
-                    eMultimedia, eRender, Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator,
-                    MMDeviceEnumerator,
-                },
-                System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED},
-            };
-
-            macro_rules! unwrap_or_return {
-                ($expr:expr) => {
-                    match $expr {
-                        Ok(val) => val,
-                        Err(_) => return,
-                    }
-                };
-            }
-
-            // Initialize the COM library for this thread.
-            // If already initialized (e.g., by another library like Tauri), this does nothing.
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-
-            let all_devices: IMMDeviceEnumerator =
-                unwrap_or_return!(CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL));
-            let default_device =
-                unwrap_or_return!(all_devices.GetDefaultAudioEndpoint(eRender, eMultimedia));
-            let volume_interface = unwrap_or_return!(
-                default_device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
-            );
-
-            let _ = volume_interface.SetMute(mute, std::ptr::null());
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        use std::process::Command;
-
-        let mute_val = if mute { "1" } else { "0" };
-        let amixer_state = if mute { "mute" } else { "unmute" };
-
-        // Try multiple backends to increase compatibility
-        // 1. PipeWire (wpctl)
-        if Command::new("wpctl")
-            .args(["set-mute", "@DEFAULT_AUDIO_SINK@", mute_val])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            return;
-        }
-
-        // 2. PulseAudio (pactl)
-        if Command::new("pactl")
-            .args(["set-sink-mute", "@DEFAULT_SINK@", mute_val])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            return;
-        }
-
-        // 3. ALSA (amixer)
-        let _ = Command::new("amixer")
-            .args(["set", "Master", amixer_state])
-            .output();
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        use std::process::Command;
-        let script = format!(
-            "set volume output muted {}",
-            if mute { "true" } else { "false" }
-        );
-        let _ = Command::new("osascript").args(["-e", &script]).output();
-    }
-}
-
-/// Reads the current system output mute state, mirroring `set_mute`'s backends.
-///
-/// Returns `Some(true)`/`Some(false)` when the state could be determined, or
-/// `None` when it couldn't (unsupported platform, missing CLI tools, or an
-/// error). Callers treat `None` as "unknown" and fall back to unmuting on stop,
-/// so we never strand the user's audio muted.
-#[cfg(target_os = "windows")]
-fn get_mute() -> Option<bool> {
-    unsafe {
-        use windows::Win32::{
-            Media::Audio::{
-                eMultimedia, eRender, Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator,
-                MMDeviceEnumerator,
-            },
-            System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED},
-        };
-
-        // Matches set_mute: no-op if COM is already initialized on this thread.
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-
-        let all_devices: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
-        let default_device = all_devices
-            .GetDefaultAudioEndpoint(eRender, eMultimedia)
-            .ok()?;
-        let volume_interface = default_device
-            .Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
-            .ok()?;
-
-        Some(volume_interface.GetMute().ok()?.as_bool())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn get_mute() -> Option<bool> {
-    use std::process::Command;
-
-    // 1. PipeWire (wpctl): prints "[MUTED]" in the volume line when muted.
-    if let Ok(out) = Command::new("wpctl")
-        .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
-        .output()
-    {
-        if out.status.success() {
-            return Some(String::from_utf8_lossy(&out.stdout).contains("[MUTED]"));
-        }
-    }
-
-    // 2. PulseAudio (pactl): prints "Mute: yes" / "Mute: no".
-    // Force LC_ALL=C so a localized system still emits the parseable English
-    // "yes"/"no" instead of e.g. "ja"/"nein".
-    if let Ok(out) = Command::new("pactl")
-        .env("LC_ALL", "C")
-        .args(["get-sink-mute", "@DEFAULT_SINK@"])
-        .output()
-    {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).to_lowercase();
-            if s.contains("yes") {
-                return Some(true);
-            }
-            if s.contains("no") {
-                return Some(false);
-            }
-        }
-    }
-
-    // 3. ALSA (amixer): prints "[off]" for muted channels, "[on]" otherwise.
-    // LC_ALL=C keeps the "[on]"/"[off]" tokens stable across locales.
-    if let Ok(out) = Command::new("amixer")
-        .env("LC_ALL", "C")
-        .args(["get", "Master"])
-        .output()
-    {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout);
-            if s.contains("[off]") {
-                return Some(true);
-            }
-            if s.contains("[on]") {
-                return Some(false);
-            }
-        }
-    }
-
-    None
-}
-
-#[cfg(target_os = "macos")]
-fn get_mute() -> Option<bool> {
-    use std::process::Command;
-
-    let out = Command::new("osascript")
-        .args(["-e", "output muted of (get volume settings)"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    match String::from_utf8_lossy(&out.stdout).trim() {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-fn get_mute() -> Option<bool> {
-    None
-}
-
-/// Restores the system mute state after our forced mute, given the state
-/// captured just before we muted. We only ever need to unmute — and only when
-/// the system was NOT already muted beforehand. If the prior state was muted,
-/// we leave it muted (the user's own state). If it's unknown (`None`), we
-/// default to unmuting so audio is never left stranded muted by us.
-fn restore_mute(prev_muted: Option<bool>) {
-    if prev_muted != Some(true) {
-        set_mute(false);
-    }
-}
-
 const WHISPER_SAMPLE_RATE: usize = 16000;
 
 /* ──────────────────────────────────────────────────────────────── */
@@ -237,24 +28,14 @@ const WHISPER_SAMPLE_RATE: usize = 16000;
 #[derive(Clone, Debug)]
 pub enum RecordingState {
     Idle,
-    Recording { binding_id: String },
-    Stopping,
+    Recording { binding_id: String, generation: u64 },
+    Stopping { generation: u64 },
 }
 
 #[derive(Clone, Debug)]
 pub enum MicrophoneMode {
     AlwaysOn,
     OnDemand,
-}
-
-/// Tracks our forced "mute while recording" so we can restore the user's audio
-/// exactly as it was. `did_mute` is true while our mute is active; `prev_muted`
-/// is the system mute state captured just before we muted, used to decide
-/// whether to unmute on stop (so a system that was already muted stays muted).
-#[derive(Debug, Default, Clone, Copy)]
-struct MuteState {
-    did_mute: bool,
-    prev_muted: Option<bool>,
 }
 
 /* ──────────────────────────────────────────────────────────────── */
@@ -313,7 +94,8 @@ pub struct AudioRecordingManager {
     recorder: Arc<Mutex<Option<AudioRecorder>>>,
     is_open: Arc<Mutex<bool>>,
     is_recording: Arc<Mutex<bool>>,
-    mute_state: Arc<Mutex<MuteState>>,
+    recording_output: RecordingOutputController,
+    capture_generation: Arc<AtomicU64>,
     close_generation: Arc<AtomicU64>,
     cancel_generation: Arc<AtomicU64>,
     stream_router: Arc<StreamRouter>,
@@ -348,7 +130,8 @@ impl AudioRecordingManager {
             recorder: Arc::new(Mutex::new(None)),
             is_open: Arc::new(Mutex::new(false)),
             is_recording: Arc::new(Mutex::new(false)),
-            mute_state: Arc::new(Mutex::new(MuteState::default())),
+            recording_output: RecordingOutputController::new(),
+            capture_generation: Arc::new(AtomicU64::new(0)),
             close_generation: Arc::new(AtomicU64::new(0)),
             cancel_generation: Arc::new(AtomicU64::new(0)),
             stream_router,
@@ -455,44 +238,15 @@ impl AudioRecordingManager {
 
     /* ---------- microphone life-cycle -------------------------------------- */
 
-    /// Applies mute if mute_while_recording is enabled and stream is open.
-    /// Snapshots the system's prior mute state first so `remove_mute` can
-    /// restore it instead of unconditionally unmuting.
-    pub fn apply_mute(&self) {
-        let settings = get_settings(&self.app_handle);
-        if !settings.mute_while_recording {
-            return;
-        }
-
-        // Lock order: is_open before mute_state (matches stop_microphone_stream).
-        let is_open = self.is_open.lock().unwrap();
-        let mut mute_guard = self.mute_state.lock().unwrap();
-        // Already muted this session — don't re-snapshot, or a duplicate/late
-        // apply would overwrite prev_muted with our own forced-muted state and
-        // strand audio muted on stop.
-        if mute_guard.did_mute {
-            return;
-        }
-        if *is_open {
-            mute_guard.prev_muted = get_mute();
-            set_mute(true);
-            mute_guard.did_mute = true;
-            debug!("Mute applied (prev_muted={:?})", mute_guard.prev_muted);
-        }
+    pub fn apply_recording_output(&self, generation: u64) {
+        self.recording_output.ready(generation);
     }
 
-    /// Removes mute if it was applied, restoring the system's prior mute state
-    /// (a system already muted before recording stays muted).
-    pub fn remove_mute(&self) {
-        let mut mute_guard = self.mute_state.lock().unwrap();
-        if mute_guard.did_mute {
-            restore_mute(mute_guard.prev_muted);
-            mute_guard.did_mute = false;
-            debug!(
-                "Mute removed (restored prev_muted={:?})",
-                mute_guard.prev_muted
-            );
-        }
+    pub fn restore_output_before_exit(&self) {
+        self.cancel_recording();
+        let _state = self.state.lock().unwrap();
+        self.stop_microphone_stream();
+        self.recording_output.restore_before_exit();
     }
 
     pub fn preload_vad(&self) -> Result<(), anyhow::Error> {
@@ -523,18 +277,6 @@ impl AudioRecordingManager {
         }
 
         let start_time = Instant::now();
-
-        // Don't mute immediately - caller will handle muting after audio feedback.
-        // The previous stream restored audio on close, so did_mute should already
-        // be false here; if it somehow isn't, restore rather than just clearing the
-        // flag, which would strand system audio muted.
-        {
-            let mut mute_guard = self.mute_state.lock().unwrap();
-            if mute_guard.did_mute {
-                restore_mute(mute_guard.prev_muted);
-                mute_guard.did_mute = false;
-            }
-        }
 
         // Get the selected device from settings, considering clamshell mode.
         // No pre-flight enumeration here: when nothing is configured the
@@ -591,22 +333,16 @@ impl AudioRecordingManager {
             return;
         }
 
-        {
-            let mut mute_guard = self.mute_state.lock().unwrap();
-            if mute_guard.did_mute {
-                restore_mute(mute_guard.prev_muted);
+        self.capture_generation.fetch_add(1, Ordering::AcqRel);
+        self.recording_output.close_after_capture(|| {
+            if let Some(rec) = self.recorder.lock().unwrap().as_mut() {
+                if *self.is_recording.lock().unwrap() {
+                    let _ = rec.stop();
+                    *self.is_recording.lock().unwrap() = false;
+                }
+                let _ = rec.close();
             }
-            mute_guard.did_mute = false;
-        }
-
-        if let Some(rec) = self.recorder.lock().unwrap().as_mut() {
-            // If still recording, stop first.
-            if *self.is_recording.lock().unwrap() {
-                let _ = rec.stop();
-                *self.is_recording.lock().unwrap() = false;
-            }
-            let _ = rec.close();
-        }
+        });
 
         *open_flag = false;
         debug!("Microphone stream stopped");
@@ -615,11 +351,14 @@ impl AudioRecordingManager {
     /* ---------- mode switching --------------------------------------------- */
 
     pub fn update_mode(&self, new_mode: MicrophoneMode) -> Result<(), anyhow::Error> {
+        // Serialize stream close/open with recording start through its output
+        // generation registration, not just through the is_open check.
+        let state = self.state.lock().unwrap();
         let cur_mode = self.mode.lock().unwrap().clone();
 
         match (cur_mode, &new_mode) {
             (MicrophoneMode::AlwaysOn, MicrophoneMode::OnDemand) => {
-                if matches!(*self.state.lock().unwrap(), RecordingState::Idle) {
+                if matches!(*state, RecordingState::Idle) {
                     self.close_generation.fetch_add(1, Ordering::SeqCst);
                     self.stop_microphone_stream();
                 }
@@ -641,14 +380,13 @@ impl AudioRecordingManager {
         &self,
         binding_id: &str,
         vad_policy: VadPolicy,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         let mut state = self.state.lock().unwrap();
 
         if let RecordingState::Idle = *state {
-            // Ensure microphone is open in on-demand mode
+            // Invalidate any previous lazy close before this recording begins.
+            self.close_generation.fetch_add(1, Ordering::SeqCst);
             if matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
-                // Cancel any pending lazy close
-                self.close_generation.fetch_add(1, Ordering::SeqCst);
                 if let Err(e) = self.start_microphone_stream() {
                     let msg = format!("{e}");
                     error!("Failed to open microphone stream: {msg}");
@@ -658,12 +396,23 @@ impl AudioRecordingManager {
 
             if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
                 if rec.start(vad_policy).is_ok() {
+                    let generation = self.capture_generation.fetch_add(1, Ordering::AcqRel) + 1;
                     *self.is_recording.lock().unwrap() = true;
                     *state = RecordingState::Recording {
                         binding_id: binding_id.to_string(),
+                        generation,
                     };
+                    let settings = get_settings(&self.app_handle);
+                    self.recording_output.begin(
+                        generation,
+                        OutputOptions {
+                            mute: settings.mute_while_recording,
+                            pause: settings.pause_while_recording,
+                            resume: settings.play_after_recording,
+                        },
+                    );
                     debug!("Recording started for binding {binding_id}");
-                    return Ok(());
+                    return Ok(generation);
                 }
             }
             Err("Recorder not available".to_string())
@@ -673,6 +422,8 @@ impl AudioRecordingManager {
     }
 
     pub fn update_selected_device(&self) -> Result<(), anyhow::Error> {
+        // Close/open and generation registration share the same state guard.
+        let _state = self.state.lock().unwrap();
         // Device settings changed; drop the cached resolution so the next
         // open re-enumerates. (The name-keyed cache would miss anyway; this
         // just avoids holding a stale cpal::Device alive.)
@@ -686,6 +437,34 @@ impl AudioRecordingManager {
         Ok(())
     }
 
+    /// Capture the stop token before dispatching asynchronous work. A delayed
+    /// stop for an older recording must never stop a new one with the same hotkey.
+    pub fn request_recording_stop(&self, binding_id: &str) -> Option<u64> {
+        let state = self.state.lock().unwrap();
+        let RecordingState::Recording {
+            binding_id: active,
+            generation,
+        } = &*state
+        else {
+            return None;
+        };
+        if active != binding_id {
+            return None;
+        }
+        self.invalidate_recording_readiness(*generation);
+        Some(*generation)
+    }
+
+    /// Reject readiness work without restoring audio into the capture tail.
+    fn invalidate_recording_readiness(&self, generation: u64) {
+        self.capture_generation.fetch_add(1, Ordering::AcqRel);
+        self.recording_output.stop_requested(generation);
+    }
+
+    pub fn is_recording_readiness_current(&self, generation: u64) -> bool {
+        self.capture_generation.load(Ordering::Acquire) == generation
+    }
+
     pub fn cancel_generation(&self) -> u64 {
         self.cancel_generation.load(Ordering::Acquire)
     }
@@ -694,118 +473,120 @@ impl AudioRecordingManager {
         self.cancel_generation.load(Ordering::Acquire) != generation
     }
 
-    pub fn stop_recording(&self, binding_id: &str, cancel_generation: u64) -> Option<Vec<f32>> {
+    pub fn stop_recording(
+        &self,
+        binding_id: &str,
+        generation: u64,
+        cancel_generation: u64,
+    ) -> Option<Vec<f32>> {
         let mut state = self.state.lock().unwrap();
-
-        match *state {
+        match &*state {
             RecordingState::Recording {
-                binding_id: ref active,
-            } if active == binding_id => {
-                *state = RecordingState::Stopping;
-                drop(state);
+                binding_id: active,
+                generation: active_generation,
+            } if active == binding_id && *active_generation == generation => {}
+            _ => return None,
+        }
+        self.invalidate_recording_readiness(generation);
+        *state = RecordingState::Stopping { generation };
+        drop(state);
 
-                // Optionally keep recording for a bit longer to capture trailing audio.
-                // This is only the explicit user setting; streaming VAD must not add
-                // hidden post-release capture time.
-                let settings = get_settings(&self.app_handle);
-                let buffer_ms = settings.extra_recording_buffer_ms;
-                if buffer_ms > 0 {
-                    debug!(
-                        "Extra recording buffer: sleeping {}ms before stopping",
-                        buffer_ms
-                    );
-                    let started = Instant::now();
-                    let buffer = Duration::from_millis(buffer_ms);
-                    while started.elapsed() < buffer {
-                        if self.was_cancelled_since(cancel_generation) {
-                            debug!("Recording stop cancelled during extra buffer");
-                            break;
-                        }
-                        let remaining = buffer.saturating_sub(started.elapsed());
-                        std::thread::sleep(remaining.min(Duration::from_millis(25)));
+        let samples = self.recording_output.finish_after_capture(generation, || {
+            // Keep both protections through the explicit capture tail. Cancel
+            // only signals this loop; the stop owner performs the actual cleanup.
+            let buffer_ms = get_settings(&self.app_handle).extra_recording_buffer_ms;
+            if buffer_ms > 0 {
+                debug!("Extra recording buffer: waiting {buffer_ms}ms before stopping");
+                let started = Instant::now();
+                let buffer = Duration::from_millis(buffer_ms);
+                while started.elapsed() < buffer {
+                    if self.was_cancelled_since(cancel_generation) {
+                        debug!("Recording stop cancelled during extra buffer");
+                        break;
                     }
-                }
-
-                let samples = if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
-                    match rec.stop() {
-                        Ok(buf) => buf,
-                        Err(e) => {
-                            error!("stop() failed: {e}");
-                            Vec::new()
-                        }
-                    }
-                } else {
-                    error!("Recorder not available");
-                    Vec::new()
-                };
-
-                *self.is_recording.lock().unwrap() = false;
-                *self.state.lock().unwrap() = RecordingState::Idle;
-
-                // In on-demand mode, close the mic (lazily if the setting is enabled)
-                if matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
-                    if get_settings(&self.app_handle).lazy_stream_close {
-                        self.schedule_lazy_close();
-                    } else {
-                        self.stop_microphone_stream();
-                    }
-                }
-
-                if self.was_cancelled_since(cancel_generation) {
-                    debug!("Recording stop cancelled; discarding captured samples");
-                    return None;
-                }
-
-                // Pad if very short
-                let s_len = samples.len();
-                // debug!("Got {} samples", s_len);
-                if s_len < WHISPER_SAMPLE_RATE && s_len > 0 {
-                    let mut padded = samples;
-                    padded.resize(WHISPER_SAMPLE_RATE * 5 / 4, 0.0);
-                    Some(padded)
-                } else {
-                    Some(samples)
+                    let remaining = buffer.saturating_sub(started.elapsed());
+                    std::thread::sleep(remaining.min(Duration::from_millis(25)));
                 }
             }
-            _ => None,
+
+            let samples = if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
+                match rec.stop() {
+                    Ok(buf) => buf,
+                    Err(error) => {
+                        error!("stop() failed: {error}");
+                        Vec::new()
+                    }
+                }
+            } else {
+                error!("Recorder not available");
+                Vec::new()
+            };
+            *self.is_recording.lock().unwrap() = false;
+            samples
+        });
+        self.finish_recording_state(generation);
+
+        if self.was_cancelled_since(cancel_generation) {
+            debug!("Recording stop cancelled; discarding captured samples");
+            return None;
         }
+        samples.map(|mut samples| {
+            if !samples.is_empty() && samples.len() < WHISPER_SAMPLE_RATE {
+                samples.resize(WHISPER_SAMPLE_RATE * 5 / 4, 0.0);
+            }
+            samples
+        })
     }
+
+    /// Publish Idle only after capture, restoration and any immediate close.
+    /// Otherwise a quick restart can be stopped by the previous recording's work.
+    fn finish_recording_state(&self, generation: u64) {
+        let mut state = self.state.lock().unwrap();
+        if !matches!(*state, RecordingState::Stopping { generation: active } if active == generation)
+        {
+            return;
+        }
+        if matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
+            if get_settings(&self.app_handle).lazy_stream_close {
+                self.schedule_lazy_close();
+            } else {
+                self.stop_microphone_stream();
+            }
+        }
+        *state = RecordingState::Idle;
+    }
+
     pub fn is_recording(&self) -> bool {
         matches!(
             *self.state.lock().unwrap(),
-            RecordingState::Recording { .. } | RecordingState::Stopping
+            RecordingState::Recording { .. } | RecordingState::Stopping { .. }
         )
     }
 
-    /// Cancel any ongoing recording without returning audio samples
+    /// Cancel uses the same capture-before-restoration path as normal Stop,
+    /// even when an always-on or lazily closed microphone remains open.
     pub fn cancel_recording(&self) {
         self.cancel_generation.fetch_add(1, Ordering::AcqRel);
         let mut state = self.state.lock().unwrap();
-
-        match *state {
-            RecordingState::Recording { .. } => {
-                *state = RecordingState::Idle;
-                drop(state);
-
-                if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
-                    let _ = rec.stop(); // Discard the result
-                }
-
-                *self.is_recording.lock().unwrap() = false;
-
-                // In on-demand mode, close the mic (lazily if the setting is enabled)
-                if matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
-                    if get_settings(&self.app_handle).lazy_stream_close {
-                        self.schedule_lazy_close();
-                    } else {
-                        self.stop_microphone_stream();
-                    }
-                }
-            }
-            RecordingState::Stopping => {
+        let generation = match *state {
+            RecordingState::Recording { generation, .. } => generation,
+            RecordingState::Stopping { generation } => {
+                self.invalidate_recording_readiness(generation);
                 debug!("Cancellation requested while recording is stopping");
+                return;
             }
-            RecordingState::Idle => {}
-        }
+            RecordingState::Idle => return,
+        };
+        self.invalidate_recording_readiness(generation);
+        *state = RecordingState::Stopping { generation };
+        drop(state);
+
+        self.recording_output.finish_after_capture(generation, || {
+            if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
+                let _ = rec.stop(); // Discard cancelled samples.
+            }
+            *self.is_recording.lock().unwrap() = false;
+        });
+        self.finish_recording_state(generation);
     }
 }

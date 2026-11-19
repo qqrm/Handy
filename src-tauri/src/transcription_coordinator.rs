@@ -1,8 +1,9 @@
+#[path = "coordinator_cleanup.rs"]
+mod cleanup;
 use crate::actions::ACTION_MAP;
-use crate::managers::audio::AudioRecordingManager;
+use cleanup::CleanupFence;
 use log::{debug, error, warn};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
@@ -31,9 +32,8 @@ enum Command {
         is_pressed: bool,
         push_to_talk: bool,
     },
-    Cancel {
-        recording_was_active: bool,
-    },
+    Cancel,
+    CancellationFinished,
     ProcessingFinished,
 }
 
@@ -86,6 +86,7 @@ impl TranscriptionCoordinator {
         thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut stage = Stage::Idle;
+                let mut cleanup = CleanupFence::default();
                 let mut last_press: Option<Instant> = None;
                 let mut pending_release: Option<PendingRelease> = None;
 
@@ -102,6 +103,7 @@ impl TranscriptionCoordinator {
                                         stop(
                                             &app,
                                             &mut stage,
+                                            &mut cleanup,
                                             &pending.binding_id,
                                             &pending.hotkey_string,
                                         );
@@ -172,7 +174,13 @@ impl TranscriptionCoordinator {
                                 } else if !is_pressed
                                     && matches!(&stage, Stage::Recording(id) if id == &binding_id)
                                 {
-                                    stop(&app, &mut stage, &binding_id, &hotkey_string);
+                                    stop(
+                                        &app,
+                                        &mut stage,
+                                        &mut cleanup,
+                                        &binding_id,
+                                        &hotkey_string,
+                                    );
                                 }
                             } else if is_pressed {
                                 match &stage {
@@ -180,7 +188,13 @@ impl TranscriptionCoordinator {
                                         start(&app, &mut stage, &binding_id, &hotkey_string);
                                     }
                                     Stage::Recording(id) if id == &binding_id => {
-                                        stop(&app, &mut stage, &binding_id, &hotkey_string);
+                                        stop(
+                                            &app,
+                                            &mut stage,
+                                            &mut cleanup,
+                                            &binding_id,
+                                            &hotkey_string,
+                                        );
                                     }
                                     _ => {
                                         debug!("Ignoring press for '{binding_id}': pipeline busy")
@@ -188,19 +202,26 @@ impl TranscriptionCoordinator {
                                 }
                             }
                         }
-                        Command::Cancel {
-                            recording_was_active,
-                        } => {
+                        Command::Cancel => {
                             pending_release = None;
-                            // Don't reset during processing — wait for the pipeline to finish.
-                            if !matches!(stage, Stage::Processing)
-                                && (recording_was_active || matches!(stage, Stage::Recording(_)))
-                            {
+                            stage = Stage::Processing;
+                            if cleanup.start_cancellation() {
+                                let app = app.clone();
+                                thread::spawn(move || {
+                                    let _guard = CancellationGuard(app.clone());
+                                    crate::utils::finish_cancellation(&app);
+                                });
+                            }
+                        }
+                        Command::CancellationFinished => {
+                            if cleanup.finish_cancellation() {
                                 stage = Stage::Idle;
                             }
                         }
                         Command::ProcessingFinished => {
-                            stage = Stage::Idle;
+                            if cleanup.finish_processing() {
+                                stage = Stage::Idle;
+                            }
                         }
                     }
                 }
@@ -237,14 +258,8 @@ impl TranscriptionCoordinator {
         }
     }
 
-    pub fn notify_cancel(&self, recording_was_active: bool) {
-        if self
-            .tx
-            .send(Command::Cancel {
-                recording_was_active,
-            })
-            .is_err()
-        {
+    pub fn cancel(&self) {
+        if self.tx.send(Command::Cancel).is_err() {
             warn!("Transcription coordinator channel closed");
         }
     }
@@ -261,24 +276,37 @@ fn start(app: &AppHandle, stage: &mut Stage, binding_id: &str, hotkey_string: &s
         warn!("No action in ACTION_MAP for '{binding_id}'");
         return;
     };
-    action.start(app, binding_id, hotkey_string);
-    if app
-        .try_state::<Arc<AudioRecordingManager>>()
-        .is_some_and(|a| a.is_recording())
-    {
+    if action.start(app, binding_id, hotkey_string) {
         *stage = Stage::Recording(binding_id.to_string());
     } else {
         debug!("Start for '{binding_id}' did not begin recording; staying idle");
     }
 }
 
-fn stop(app: &AppHandle, stage: &mut Stage, binding_id: &str, hotkey_string: &str) {
+fn stop(
+    app: &AppHandle,
+    stage: &mut Stage,
+    cleanup: &mut CleanupFence,
+    binding_id: &str,
+    hotkey_string: &str,
+) {
     let Some(action) = ACTION_MAP.get(binding_id) else {
         warn!("No action in ACTION_MAP for '{binding_id}'");
         return;
     };
-    action.stop(app, binding_id, hotkey_string);
+    cleanup.start_processing();
     *stage = Stage::Processing;
+    action.stop(app, binding_id, hotkey_string);
+}
+
+struct CancellationGuard(AppHandle);
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        if let Some(coordinator) = self.0.try_state::<TranscriptionCoordinator>() {
+            let _ = coordinator.tx.send(Command::CancellationFinished);
+        }
+    }
 }
 
 #[cfg(test)]

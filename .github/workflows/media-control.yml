@@ -5,8 +5,15 @@ on:
   push:
     paths:
       - "src-tauri/src/lib.rs"
+      - "src-tauri/src/actions.rs"
+      - "src-tauri/src/utils.rs"
+      - "src-tauri/src/transcription_coordinator.rs"
+      - "src-tauri/src/coordinator_cleanup.rs"
+      - "src-tauri/src/managers/**"
+      - "src-tauri/src/audio_toolkit/**"
       - "src-tauri/src/media_control*"
       - "src-tauri/tests/media-control/**"
+      - "scripts/ci/media_control*"
       - "src-tauri/Cargo.*"
       - "src-tauri/build.rs"
       - "src-tauri/tauri*.conf.json"
@@ -17,8 +24,15 @@ on:
   pull_request:
     paths:
       - "src-tauri/src/lib.rs"
+      - "src-tauri/src/actions.rs"
+      - "src-tauri/src/utils.rs"
+      - "src-tauri/src/transcription_coordinator.rs"
+      - "src-tauri/src/coordinator_cleanup.rs"
+      - "src-tauri/src/managers/**"
+      - "src-tauri/src/audio_toolkit/**"
       - "src-tauri/src/media_control*"
       - "src-tauri/tests/media-control/**"
+      - "scripts/ci/media_control*"
       - "src-tauri/Cargo.*"
       - "src-tauri/build.rs"
       - "src-tauri/tauri*.conf.json"
@@ -29,45 +43,180 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  validation-cache:
+    name: Select exact-commit validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      reuse: ${{ steps.proof.outputs.reuse }}
+    steps:
+      # The candidate is validated before advancing the existing external PR.
+      # Reusing that exact SHA avoids a second identical full Windows build.
+      # Dispatches, PRs, verification branches and cache misses run every job.
+      - name: Find completed candidate proof
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          sha = os.environ['GITHUB_SHA']
+          repo = os.environ['GITHUB_REPOSITORY']
+          evidence = None
+          if os.environ['GITHUB_EVENT_NAME'] == 'push' and os.environ['GITHUB_REF'] == 'refs/heads/win-pause-all-sessions':
+              def read_api(path):
+                  request = urllib.request.Request(
+                      os.environ['GITHUB_API_URL'] + '/repos/' + repo + path,
+                      headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                               'Accept': 'application/vnd.github+json',
+                               'X-GitHub-Api-Version': '2022-11-28'},
+                  )
+                  with urllib.request.urlopen(request, timeout=15) as response:
+                      return json.load(response)
+
+              try:
+                  query = urllib.parse.urlencode({'head_sha': sha, 'status': 'success', 'per_page': 10})
+                  runs = read_api('/actions/workflows/media-control.yml/runs?' + query)['workflow_runs']
+                  expected = {'Media policy (ubuntu-24.04)', 'Media policy (windows-2025)', 'Full Windows application build'}
+                  for run in runs:
+                      if (run.get('head_sha') != sha or run.get('head_branch') != 'verify/pause-mute-upstream'
+                              or run.get('event') != 'push' or run.get('status') != 'completed'
+                              or run.get('conclusion') != 'success'
+                              or run.get('path') != '.github/workflows/media-control.yml'
+                              or run.get('repository', {}).get('full_name') != repo):
+                          continue
+                      jobs = read_api('/actions/runs/' + str(int(run['id'])) + '/jobs?per_page=100')['jobs']
+                      completed = {job['name'] for job in jobs
+                                   if job.get('status') == 'completed' and job.get('conclusion') == 'success'}
+                      if expected <= completed:
+                          evidence = run
+                          break
+              except (KeyError, TypeError, ValueError, OSError, urllib.error.URLError) as error:
+                  print('No reusable proof; running full validation: ' + type(error).__name__)
+          with Path(os.environ['GITHUB_OUTPUT']).open('a') as output:
+              output.write('reuse=' + ('true' if evidence else 'false') + '\n')
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as summary:
+              if evidence:
+                  summary.write('Reusing completed validation of the identical commit `' + sha + '`:\n\n'
+                                + '[Linux/Windows tests, native fixtures and full Windows build]('
+                                + evidence['html_url'] + ').\n')
+              else:
+                  summary.write('Running full validation for `' + sha + '`. No reusable exact-commit proof.\n')
+          PY
+
   media-control:
+    name: Media policy (${{ matrix.os }})
+    needs: validation-cache
+    if: needs.validation-cache.outputs.reuse != 'true'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-24.04, windows-2025]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable
+        with:
+          toolchain: stable
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri/tests/media-control -> target
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
       - name: Check harness formatting
         run: cargo fmt --manifest-path src-tauri/tests/media-control/Cargo.toml -- --check
       - name: Check media control with Clippy
         run: cargo clippy --locked --manifest-path src-tauri/tests/media-control/Cargo.toml --all-targets -- -D warnings
-      - name: Test partial failures and playback recovery
+      - name: Test pause, mute, partial failures and lifecycle recovery
         run: cargo test --locked --manifest-path src-tauri/tests/media-control/Cargo.toml
+      - name: Fetch the immutable historical policy for regression proof
+        if: matrix.os == 'ubuntu-24.04'
+        run: git fetch --no-tags --depth=1 origin e6f12faac5c93b6a2ab967bac96b3ead10cec1ec
+      - name: Prove legacy regressions and runtime mutation sensitivity
+        id: evidence
+        if: matrix.os == 'ubuntu-24.04'
+        run: python3 scripts/ci/media_control_regressions.py --evidence "$RUNNER_TEMP/media-control-evidence"
+      - name: Preserve small proof receipts and assertion logs
+        if: always() && matrix.os == 'ubuntu-24.04' && steps.evidence.outcome != 'skipped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: legacy-media-regression-evidence
+          path: ${{ runner.temp }}/media-control-evidence
+          if-no-files-found: error
+          retention-days: 14
+      - name: Verify real Windows SMTC and both resume policies
+        if: matrix.os == 'windows-2025'
+        env:
+          HANDY_RUN_ISOLATED_SMTC_TESTS: "1"
+        shell: pwsh
+        run: |
+          $test = 'media_control::platform_windows::native_test::isolated_windows_video_pause_resume_and_legacy_policy'
+          $output = & cargo test --locked --manifest-path src-tauri/tests/media-control/Cargo.toml $test -- --exact --ignored --nocapture --test-threads=1 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | Write-Output
+          if ($exitCode -ne 0) { throw "Native test failed: $test (exit $exitCode)" }
+          $named = @($output | Where-Object { $_ -match ('^test ' + [regex]::Escape($test) + ' \.\.\.') })
+          $passed = @($output | Where-Object { $_ -match '^test result: ok\. 1 passed; 0 failed; 0 ignored;' })
+          if ($named.Count -ne 1 -or $passed.Count -ne 1) { throw 'Expected exactly one actual passing native SMTC test' }
+      - name: Install a private PulseAudio fixture
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pulseaudio pulseaudio-utils
+      - name: Verify original-output restoration on the real Linux audio service
+        if: matrix.os == 'ubuntu-24.04'
+        env:
+          HANDY_RUN_ISOLATED_OUTPUT_MUTE_TESTS: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          test='output_mute::platform::native_tests::isolated_pulseaudio_mute_restores_original_sink'
+          log="$RUNNER_TEMP/output-mute-native.log"
+          cargo test --locked --manifest-path src-tauri/tests/media-control/Cargo.toml "$test" -- --exact --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
+          TEST_NAME="$test" TEST_LOG="$log" python3 - <<'PY'
+          import os
+          from pathlib import Path
+          lines = Path(os.environ['TEST_LOG']).read_text().splitlines()
+          name = 'test ' + os.environ['TEST_NAME'] + ' ...'
+          assert sum(line.startswith(name) for line in lines) == 1, 'Expected one named test'
+          assert sum(line.startswith('test result: ok. 1 passed; 0 failed; 0 ignored;') for line in lines) == 1, 'Expected one actual passing native output test'
+          PY
 
   windows-app:
     name: Full Windows application build
-    runs-on: windows-latest
+    needs: validation-cache
+    if: needs.validation-cache.outputs.reuse != 'true'
+    runs-on: windows-2025
     timeout-minutes: 60
     steps:
       - name: Preserve LF line endings
         run: git config --global core.autocrlf false
-      - uses: actions/checkout@v5
-      - uses: oven-sh/setup-bun@v2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable
+        with:
+          toolchain: stable
           components: rustfmt
-      - uses: swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: "./src-tauri -> target"
       - name: Install frontend dependencies
@@ -77,10 +226,10 @@ jobs:
       - name: Check formatting
         run: bun run format:check
       - name: Install Vulkan SDK
-        uses: humbletim/install-vulkan-sdk@v1.2
+        uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff # v1.2
         with:
           version: 1.4.309.0
-          cache: true
+          cache: false
       - name: Install SPIRV-Headers
         shell: pwsh
         run: |
@@ -89,18 +238,19 @@ jobs:
           $prefix = "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows" -replace '\\','/'
           $combined = if ($env:CMAKE_PREFIX_PATH) { "$prefix;$env:CMAKE_PREFIX_PATH" } else { $prefix }
           Add-Content $env:GITHUB_ENV "CMAKE_PREFIX_PATH=$combined"
-      - name: Install ONNX Runtime
+      - name: Install verified ONNX Runtime
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $version = "1.24.2"
-          $archive = Join-Path $env:RUNNER_TEMP "ort.zip"
-          $destination = Join-Path $env:RUNNER_TEMP "ort-dist"
-          Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v$version/onnxruntime-win-x64-$version.zip" -OutFile $archive
-          Expand-Archive -Path $archive -DestinationPath $destination -Force
-          $ortLib = (Resolve-Path "$destination/onnxruntime-win-x64-$version/lib").Path
-          Add-Content $env:GITHUB_ENV "ORT_LIB_LOCATION=$ortLib"
-          Add-Content $env:GITHUB_ENV "ORT_PREFER_DYNAMIC_LINK=1"
+          $archive = Join-Path $env:RUNNER_TEMP 'ort-1.24.2.zip'
+          # Same rc.12-compatible version as before, from Microsoft's CPU NuGet package.
+          Invoke-WebRequest 'https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.24.2/microsoft.ml.onnxruntime.1.24.2.nupkg' -OutFile $archive
+          $expected = '782564d3d68e87269ea1812cc94710ad06fe014faf093f01a6f89d0bd58719d3'
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'ONNX Runtime checksum mismatch' }
+          $destination = Join-Path $env:RUNNER_TEMP 'ort-1.24.2'
+          Expand-Archive $archive -DestinationPath $destination
+          Add-Content $env:GITHUB_ENV "ORT_LIB_LOCATION=$destination/runtimes/win-x64/native"
+          Add-Content $env:GITHUB_ENV 'ORT_PREFER_DYNAMIC_LINK=1'
       # Compile and link the real crate, including lib.rs, which the isolated
       # media-control harness does not exercise. Skip installer signing.
       - name: Build full Windows application
