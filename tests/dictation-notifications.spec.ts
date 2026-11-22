@@ -11,6 +11,13 @@ async function expectUnclipped(page: Page) {
         const rect = element.getBoundingClientRect();
         return {
           element: element.tagName,
+          bounds: {
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+          },
+          viewport: { width: innerWidth, height: innerHeight },
           withinWindow:
             rect.left >= 0 &&
             rect.top >= 0 &&
@@ -26,7 +33,7 @@ async function expectUnclipped(page: Page) {
   for (const element of bounds) {
     expect(
       element,
-      "notification text must fit the real popup dimensions",
+      `notification must fit the real popup dimensions: ${JSON.stringify(element)}`,
     ).toMatchObject({ withinWindow: true, withinOwnBox: true });
   }
 }
@@ -75,13 +82,15 @@ for (const [language, strings] of Object.entries({ en, ru })) {
       },
     ];
     for (const outcome of outcomes) {
-      await page.evaluate(
-        (notice) => window.notificationFixture.show(notice),
-        outcome.notice,
-      );
-      await expect(page.getByRole("heading")).toHaveText(outcome.title);
-      await expect(page.locator(".notice p")).toHaveText(outcome.body);
-      await expectUnclipped(page);
+      await test.step(`${outcome.notice.kind}: ${outcome.notice.reason ?? ""}`, async () => {
+        await page.evaluate(
+          (notice) => window.notificationFixture.show(notice),
+          outcome.notice,
+        );
+        await expect(page.getByRole("heading")).toHaveText(outcome.title);
+        await expect(page.locator(".notice p")).toHaveText(outcome.body);
+        await expectUnclipped(page);
+      });
     }
     expect(
       (await page.evaluate(() => window.notificationFixture.snapshot()))

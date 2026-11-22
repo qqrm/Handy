@@ -44,7 +44,7 @@ body,
   align-items: flex-start;
   gap: 14px;
   margin: 6px;
-  padding: 20px;
+  padding: 12px 20px;
   min-height: 116px;
   box-sizing: border-box;
   border: 1px solid var(--notice-border);

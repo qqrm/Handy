@@ -66,8 +66,11 @@ clipboard fallback.
   offsets must agree with UI Automation before insertion is allowed.
 - Other controls require both UIA ValuePattern and TextPattern. The complete
   text and a single unambiguous selection must agree between those patterns.
-  ValuePattern updates that same element and the result is read back. A generic
-  browser contenteditable or application editor can be unsupported.
+  ValuePattern updates that same element and the result is read back. Since a
+  browser can acknowledge SetValue before its renderer applies it, confirmation
+  waits up to 750 ms within the original request deadline while the old value
+  remains intact. Only reads are retried; the write is issued once. A generic
+  browser contenteditable or application editor can still be unsupported.
 - A focused Edit/Document with TextPattern but no ValuePattern can retain a
   foreground-only target. This requires a keyboard-focusable field with an
   explicit `IsReadOnly = false` text attribute; mixed/unknown attributes are

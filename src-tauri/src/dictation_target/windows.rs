@@ -938,9 +938,26 @@ impl Target {
             }
             Writer::Foreground => return Err(TargetError::Unsupported),
         }
-        self.validate(false).map_err(|_| TargetError::Uncertain)?;
-        if self.current_value().map_err(|_| TargetError::Uncertain)? != expected {
-            return Err(TargetError::Uncertain);
+        let readback_deadline = deadline.min(Instant::now() + READBACK_TIMEOUT);
+        let mut backoff = Duration::from_millis(15);
+        loop {
+            self.validate(false).map_err(|_| TargetError::Uncertain)?;
+            let current = self.current_value().map_err(|_| TargetError::Uncertain)?;
+            if current == expected {
+                break;
+            }
+            if !matches!(self.writer, Writer::Value(_))
+                || current != self.text.value
+                || Instant::now() >= readback_deadline
+                || !active.load(Ordering::Acquire)
+            {
+                return Err(TargetError::Uncertain);
+            }
+            // A UIA SetValue acknowledgement can precede the renderer's update
+            // (for example in Chromium). Retry only reads of the addressed
+            // element while its original value remains intact, never SetValue.
+            thread::sleep(backoff.min(readback_deadline.saturating_duration_since(Instant::now())));
+            backoff = (backoff * 2).min(Duration::from_millis(120));
         }
         // A caret restoration failure must not trigger another insertion. The
         // text is already confirmed; it only disables subsequent auto-submit.

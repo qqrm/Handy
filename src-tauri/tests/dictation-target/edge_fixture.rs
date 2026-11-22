@@ -530,12 +530,16 @@ fn edge_contenteditable_delivery_fixture() {
         eprintln!("Edge contenteditable route: addressed UIA insertion");
         unsafe { other_field.SetFocus() }.unwrap();
         wait_focus(&automation, &other_field);
-        assert!(
-            target
-                .insert_if_active("dictation ", active)
-                .unwrap()
-                .verified
-        );
+        let receipt = target
+            .insert_if_active("dictation ", active)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "addressed UIA delivery failed: {error:?}; fixture target: {:?}; other field: {:?}",
+                    read_field(&target_field),
+                    read_field(&other_field)
+                )
+            });
+        assert!(receipt.verified);
         let focused = unsafe { automation.GetFocusedElement() }.unwrap();
         assert!(
             unsafe { automation.CompareElements(&focused, &other_field) }
