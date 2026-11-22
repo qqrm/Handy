@@ -731,6 +731,28 @@ impl Target {
         let native = matches!(strategy, CaptureStrategy::Automatic)
             && (identity.class.eq_ignore_ascii_case("edit")
                 || identity.class.to_ascii_lowercase().starts_with("richedit"));
+        let value_pattern = if matches!(strategy, CaptureStrategy::Automatic) && !native {
+            let framework = unsafe { element.CurrentFrameworkId() }
+                .map_err(unavailable)?
+                .to_string();
+            // Chromium's SetValue can focus a background contenteditable as a
+            // side effect. An exposed ValuePattern therefore does not make it
+            // a safe addressed writer. Keep the frozen TextPattern target and
+            // use a guarded foreground paste, or clipboard fallback if moved.
+            if framework.eq_ignore_ascii_case("Chrome")
+                || identity.class.to_ascii_lowercase().starts_with("chrome_")
+            {
+                None
+            } else {
+                unsafe {
+                    element
+                        .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                        .ok()
+                }
+            }
+        } else {
+            None
+        };
         let (writer, text) = if native {
             if unsafe { element.CurrentNativeWindowHandle() }.map_err(unavailable)? != identity.hwnd
                 || !unsafe { IsWindowUnicode(identity.hwnd) }.as_bool()
@@ -749,14 +771,7 @@ impl Target {
                 return Err(TargetError::Unsupported);
             }
             (Writer::Native, TextSnapshot::new(value, selection)?)
-        } else if let Some(value_pattern) = matches!(strategy, CaptureStrategy::Automatic)
-            .then(|| unsafe {
-                element
-                    .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
-                    .ok()
-            })
-            .flatten()
-        {
+        } else if let Some(value_pattern) = value_pattern {
             if unsafe { value_pattern.CurrentIsReadOnly() }
                 .map_err(unavailable)?
                 .as_bool()

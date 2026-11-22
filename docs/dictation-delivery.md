@@ -38,8 +38,9 @@ acquisition falls back to the clipboard.
 
 Delivery uses the following order:
 
-1. For supported native Edit/RichEdit controls and UI Automation ValuePattern
-   fields, insert through the captured target without activating another window.
+1. For supported native Edit/RichEdit controls and non-Chromium UI Automation
+   ValuePattern fields, insert through the captured target without activating
+   another window.
 2. Some browser editors provide text/selection access but no background writer.
    Their normal paste command is permitted only if the original field, document
    value, focus and caret/selection still match. The clipboard is checked again
@@ -48,6 +49,11 @@ Delivery uses the following order:
 3. If the target is unavailable, changed, read-only, protected, or unsupported,
    keep the complete transcription in the ordinary clipboard for manual paste
    or Windows clipboard history (`Win+V`). The failure notification is optional.
+
+Chromium/Edge editors always use the guarded foreground route even when they
+advertise ValuePattern: native Windows testing showed that their SetValue action
+can steal focus. After switching away from such an editor, the result therefore
+stays in the clipboard; Handy does not attempt that background write.
 
 Snapshots are one-shot. Process/window identity, accessibility identity, document
 context, text and selection are checked where the provider exposes them. Closed

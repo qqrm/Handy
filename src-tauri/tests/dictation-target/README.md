@@ -71,6 +71,11 @@ clipboard fallback.
   waits up to 750 ms within the original request deadline while the old value
   remains intact. Only reads are retried; the write is issued once. A generic
   browser contenteditable or application editor can still be unsupported.
+- Chromium/Edge providers (`FrameworkId = Chrome` or a `Chrome_*` native host)
+  use the foreground-only route even when ValuePattern is exposed. The real
+  Edge fixture demonstrated that SetValue can move focus to its target as a
+  provider side effect. If that field is no longer focused, delivery falls back
+  to the clipboard without attempting SetValue or restoring focus afterwards.
 - A focused Edit/Document with TextPattern but no ValuePattern can retain a
   foreground-only target. This requires a keyboard-focusable field with an
   explicit `IsReadOnly = false` text attribute; mixed/unknown attributes are
