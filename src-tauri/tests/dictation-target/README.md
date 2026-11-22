@@ -10,10 +10,14 @@ cargo clippy --manifest-path src-tauri/tests/dictation-target/Cargo.toml --all-t
 ```
 
 On a Windows desktop with Microsoft Edge installed, run the explicit fixtures
-as well. These interact with their own visible windows and must run serially:
+as well. These interact with their own visible windows and must run serially,
+with one scenario per process as in the Windows CI job:
 
 ```sh
-cargo test --manifest-path src-tauri/tests/dictation-target/Cargo.toml --locked -- --ignored --test-threads=1
+cargo test --manifest-path src-tauri/tests/dictation-target/Cargo.toml --locked native_fixture::native_control_lifecycle_fixture -- --exact --ignored --test-threads=1
+cargo test --manifest-path src-tauri/tests/dictation-target/Cargo.toml --locked native_fixture::foreground_readback_fixture -- --exact --ignored --test-threads=1
+cargo test --manifest-path src-tauri/tests/dictation-target/Cargo.toml --locked native_fixture::deferred_capture_fixture -- --exact --ignored --test-threads=1
+cargo test --manifest-path src-tauri/tests/dictation-target/Cargo.toml --locked edge_fixture::edge_contenteditable_delivery_fixture -- --exact --ignored --test-threads=1
 ```
 
 The fixture creates two real Win32 edit controls and uses the public production

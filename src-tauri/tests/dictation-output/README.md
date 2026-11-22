@@ -19,9 +19,13 @@ require the later focus to remain untouched in either valid outcome.
 cargo test --manifest-path src-tauri/tests/dictation-output/Cargo.toml
 cargo clippy --manifest-path src-tauri/tests/dictation-output/Cargo.toml --all-targets -- -D warnings
 cargo clippy --manifest-path src-tauri/tests/dictation-output/Cargo.toml --all-targets --target x86_64-pc-windows-msvc -- -D warnings
-# On an interactive Windows test desktop only:
-cargo test --manifest-path src-tauri/tests/dictation-output/Cargo.toml -- --ignored --test-threads=1
+# On an interactive Windows test desktop only, one scenario per process:
+cargo test --manifest-path src-tauri/tests/dictation-output/Cargo.toml windows_output::output_resolves_pending_capture_and_uses_frozen_settings -- --exact --ignored --test-threads=1
 ```
+
+The Windows CI enumerates all five output scenarios as separate exact commands.
+This preserves foreground activation eligibility when the previous scenario has
+destroyed its last GUI thread; each command must execute one passing test.
 
 Linux execution verifies clipboard completion, cancellation, stale-session
 rejection, fallback/error reporting and the portable capture-moment policy.

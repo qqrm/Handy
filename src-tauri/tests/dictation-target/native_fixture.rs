@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::{Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -13,10 +13,11 @@ use windows::Win32::UI::Controls::{EM_REPLACESEL, EM_SETSEL};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
-    GetMessageW, GetWindowLongW, PostThreadMessageW, RegisterClassW, SendMessageW,
+    GetMessageW, GetWindowLongW, PeekMessageW, PostThreadMessageW, RegisterClassW, SendMessageW,
     SetForegroundWindow, SetWindowLongW, ShowWindow, UnregisterClassW, ES_AUTOHSCROLL, ES_PASSWORD,
-    ES_READONLY, GWL_STYLE, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_GETTEXT,
-    WM_GETTEXTLENGTH, WM_SETTEXT, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    ES_READONLY, GWL_STYLE, MSG, PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    WM_GETTEXT, WM_GETTEXTLENGTH, WM_SETTEXT, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WS_VISIBLE,
 };
 
 const WAKE: u32 = WM_APP + 0x71;
@@ -71,10 +72,41 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = self.call(Action::Stop);
-        if let Some(worker) = self.worker.take() {
-            worker.join().expect("fixture thread");
+        let (reply, result) = mpsc::channel();
+        if self
+            .sender
+            .send(Request {
+                action: Action::Stop,
+                reply,
+            })
+            .is_ok()
+            && unsafe { PostThreadMessageW(self.thread_id, WAKE, WPARAM(0), LPARAM(0)) }.is_ok()
+        {
+            let _ = result.recv_timeout(WAIT);
         }
+        if let Some(worker) = self.worker.take() {
+            if let Err(error) = worker.join() {
+                // Preserve the original setup/assertion failure instead of
+                // aborting the whole harness with a second panic in Drop.
+                if !thread::panicking() {
+                    std::panic::resume_unwind(error);
+                }
+            }
+        }
+    }
+}
+
+struct FixtureWindows {
+    top_a: HWND,
+    top_b: HWND,
+    instance: HINSTANCE,
+}
+
+impl Drop for FixtureWindows {
+    fn drop(&mut self) {
+        let _ = unsafe { DestroyWindow(self.top_a) };
+        let _ = unsafe { DestroyWindow(self.top_b) };
+        let _ = unsafe { UnregisterClassW(w!("HandyPinnedTargetFixture"), Some(self.instance)) };
     }
 }
 
@@ -111,10 +143,25 @@ fn read_value(hwnd: HWND) -> String {
 
 fn focus(top: HWND, edit: HWND) {
     let _ = unsafe { ShowWindow(top, SW_SHOW) };
-    let _ = unsafe { SetForegroundWindow(top) };
-    let _ = unsafe { SetFocus(Some(edit)) };
-    assert_eq!(unsafe { GetForegroundWindow() }, top);
-    assert_eq!(unsafe { GetFocus() }, edit);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let _ = unsafe { SetForegroundWindow(top) };
+        let _ = unsafe { SetFocus(Some(edit)) };
+        let mut message = MSG::default();
+        while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+            unsafe { DispatchMessageW(&message) };
+        }
+        if unsafe { GetForegroundWindow() } == top && unsafe { GetFocus() } == edit {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture could not acquire real foreground/focus: expected {top:?}/{edit:?}, actual {:?}/{:?}",
+            unsafe { GetForegroundWindow() },
+            unsafe { GetFocus() }
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 unsafe extern "system" fn window_proc(
@@ -156,6 +203,11 @@ fn fixture_thread(receiver: mpsc::Receiver<Request>, ready: mpsc::Sender<u32>) {
     };
     let top_a = make_window(w!("Handy fixture document A"), true);
     let top_b = make_window(w!("Handy fixture document B"), false);
+    let _windows = FixtureWindows {
+        top_a,
+        top_b,
+        instance,
+    };
     let make_edit = |parent: HWND| {
         unsafe {
             CreateWindowExW(
@@ -235,10 +287,6 @@ fn fixture_thread(receiver: mpsc::Receiver<Request>, ready: mpsc::Sender<u32>) {
                     String::new()
                 }
                 Action::Stop => {
-                    unsafe { DestroyWindow(top_a) }.unwrap();
-                    unsafe { DestroyWindow(top_b) }.unwrap();
-                    unsafe { UnregisterClassW(w!("HandyPinnedTargetFixture"), Some(instance)) }
-                        .unwrap();
                     let _ = request.reply.send(String::new());
                     return;
                 }

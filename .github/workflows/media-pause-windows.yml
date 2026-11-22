@@ -250,10 +250,22 @@ jobs:
             $native | Write-Output
             if ($nativeExitCode -ne 0 -or ($native -join "`n") -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') { throw "Native target fixture did not pass exactly once: $nativeTest" }
           }
-          $output = & cargo test --locked --manifest-path src-tauri/tests/dictation-output/Cargo.toml windows_output:: -- --ignored --nocapture --test-threads=1 2>&1
-          $outputExitCode = $LASTEXITCODE
-          $output | Write-Output
-          if ($outputExitCode -ne 0 -or ($output -join "`n") -notmatch 'test result: ok\. 5 passed; 0 failed; 0 ignored;') { throw 'Expected five real-window dictation output cases' }
+          # A fresh process receives foreground activation eligibility from the
+          # runner. Reusing one process after destroying its last GUI thread can
+          # legitimately lose that eligibility before the next fixture starts.
+          $outputTests = @(
+            'windows_output::output_resolves_pending_capture_and_uses_frozen_settings',
+            'windows_output::pending_start_capture_never_follows_the_later_stop_focus',
+            'windows_output::output_captures_end_destination_before_recognition_only',
+            'windows_output::destroyed_target_keeps_the_complete_text_in_clipboard',
+            'windows_output::clipboard_stop_does_not_insert_or_submit_to_any_control'
+          )
+          foreach ($outputTest in $outputTests) {
+            $output = & cargo test --locked --manifest-path src-tauri/tests/dictation-output/Cargo.toml $outputTest -- --exact --ignored --nocapture --test-threads=1 2>&1
+            $outputExitCode = $LASTEXITCODE
+            $output | Write-Output
+            if ($outputExitCode -ne 0 -or ($output -join "`n") -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') { throw "Native output case did not pass exactly once: $outputTest" }
+          }
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri -> target
