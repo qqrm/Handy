@@ -397,6 +397,10 @@ fn worker(
     let mut target = match Target::capture(strategy, &anchor) {
         Ok(target) => target,
         Err(error) => {
+            // Destruction or a focus switch can make a provider capability
+            // query fail before capture reaches its final anchor check. Keep
+            // that lifecycle failure distinct from a stable unsupported field.
+            let error = anchor.validate().err().unwrap_or(error);
             let _ = ready.send(Err(error));
             return;
         }
