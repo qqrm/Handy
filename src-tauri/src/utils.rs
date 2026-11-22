@@ -84,6 +84,8 @@ fn native_windows_machine() -> Option<u16> {
 /// Centralized cancellation function that can be called from anywhere in the app.
 /// The coordinator keeps new starts queued until all cancellation cleanup finishes.
 pub fn cancel_current_operation(app: &AppHandle) {
+    crate::recording_reminders::stop(app);
+    crate::dictation_output::cancel(app);
     if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
         coordinator.cancel();
     } else {

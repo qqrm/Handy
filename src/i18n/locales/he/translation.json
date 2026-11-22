@@ -179,6 +179,10 @@
           "transcribe_with_post_process": {
             "name": "קיצור לעיבוד משלים",
             "description": "אופציונלי: קיצור מקשים ייעודי שתמיד מפעיל עיבוד AI על התמלול."
+          },
+          "transcribe_to_clipboard": {
+            "name": "Finish to clipboard",
+            "description": "Press during recording to stop, transcribe and copy the result without inserting or submitting it. This shortcut does not start a recording."
           }
         },
         "errors": {
@@ -207,6 +211,24 @@
           "push_to_talk": "מקליט כל עוד קיצור הדרך לחוץ",
           "toggle": "הקישו על קיצור הדרך כדי להתחיל להקליט, והקישו שוב כדי לעצור"
         }
+      },
+      "dictationDelivery": {
+        "title": "Dictation destination",
+        "targetLabel": "Remember the field and cursor",
+        "targetDescription": "Remember the input field and cursor or selection at this point. If insertion into that field is unavailable, keep the text in the clipboard without submitting it. Some applications do not support targeted insertion.",
+        "recordingStart": "At recording start",
+        "recordingEnd": "At recording end",
+        "notifyLabel": "Notify when insertion is unavailable",
+        "notifyDescription": "Show a notification if the application closed, the field changed or it does not support safe insertion. The full transcription stays in the clipboard."
+      },
+      "recordingReminders": {
+        "title": "Forgotten recording reminders",
+        "enabledLabel": "Remind me while recording continues",
+        "enabledDescription": "For recordings started and stopped with separate presses, including a tap in Auto mode. No reminders while holding the shortcut. Speech and silence do not reset the timer.",
+        "minutesLabel": "First reminder after (minutes)",
+        "minutesDescription": "From 1 to 120 minutes. The interval doubles after each reminder: at {{first}}, {{second}}, {{third}} minutes from the start, and so on.",
+        "soundLabel": "Add a sound to notifications",
+        "soundDescription": "Play one short sound with each reminder, including the first. Uses the volume and output device from Sound settings. If that output is muted while recording, the notification is still shown but the sound is inaudible."
       }
     },
     "models": {
@@ -720,5 +742,19 @@
     "learnMore": "איך לתקן את זה",
     "recorderBlocked": "לא ניתן להקליט קיצורים כרגע — Secure Input של macOS חוסם אירועי מקשים. פתור תחילה את אזהרת Secure Input.",
     "dismiss": "התעלם"
+  },
+  "notifications": {
+    "recordingTitle": "Recording is still running",
+    "recordingBody": "You have been recording for {{duration}}.",
+    "deliveryFallbackTitle": "Text saved to clipboard",
+    "deliveryFallbackBody": "Could not insert into the selected field. Paste the text when you are ready.",
+    "targetUnavailable": "The original application or input field is no longer available.",
+    "targetChanged": "The original field or its text changed.",
+    "targetUnsupported": "This field does not support safe insertion.",
+    "clipboardErrorTitle": "Could not copy text",
+    "clipboardErrorBody": "The clipboard is unavailable. Handy did not paste or submit the text.",
+    "deliveryUncertainBody": "The insertion could not be confirmed. The text is also in the clipboard. Check the field before pasting again.",
+    "autoSubmitSkippedTitle": "Text inserted",
+    "autoSubmitSkippedBody": "Automatic submission was skipped because focus changed or a modifier key is still held."
   }
 }
