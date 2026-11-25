@@ -5,6 +5,12 @@
 #[path = "../../src/managers/media_pause.rs"]
 mod media_pause;
 
+#[path = "../../src/managers/output_mute.rs"]
+mod output_mute;
+
+#[path = "../../src/managers/recording_output.rs"]
+mod recording_output;
+
 #[cfg(target_os = "macos")]
 #[path = "../../src/managers/media_pause_macos_fixture.rs"]
 mod quicktime_fixture;

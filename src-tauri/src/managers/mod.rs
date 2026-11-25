@@ -2,6 +2,8 @@ pub mod audio;
 pub mod gguf_meta;
 pub mod history;
 mod media_pause;
+mod output_mute;
+mod recording_output;
 #[cfg(target_os = "macos")]
 pub(crate) use media_pause::request_quicktime_permission;
 pub mod model;

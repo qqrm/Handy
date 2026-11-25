@@ -144,8 +144,9 @@ jobs:
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
       - name: install Rust stable
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable
         with:
+          toolchain: stable
           # Those targets are only used on macos runners so it's in an `if` to slightly speed up windows and linux builds.
           targets: ${{ contains(inputs.platform, 'macos') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
@@ -444,18 +445,20 @@ jobs:
       # onnxruntime.dll into transcribe-libs/, which tauri.windows.conf.json bundles
       # beside Handy.exe. ARM64 is excluded (all modern CPUs; keeps its static
       # ORT posture).
-      # NOTE: sourced from Microsoft's GitHub release; can be re-hosted on
-      # blob.handy.computer to match the macOS/Linux steps.
+      # Sourced from Microsoft's CPU NuGet package at the same pinned version.
+      # The package bytes were verified against NuGet's catalog SHA-512.
       - name: Install ONNX Runtime (Windows x64)
         if: contains(inputs.platform, 'windows') && !contains(inputs.target, 'aarch64')
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $ORT_VERSION = "1.24.2"
-          $url = "https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/onnxruntime-win-x64-$ORT_VERSION.zip"
+          $url = "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/$ORT_VERSION/microsoft.ml.onnxruntime.$ORT_VERSION.nupkg"
           Invoke-WebRequest -Uri $url -OutFile ort.zip
+          $expected = '782564d3d68e87269ea1812cc94710ad06fe014faf093f01a6f89d0bd58719d3'
+          if ((Get-FileHash ort.zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'ONNX Runtime checksum mismatch' }
           Expand-Archive -Path ort.zip -DestinationPath ort-dist -Force
-          $ortLib = (Resolve-Path "ort-dist/onnxruntime-win-x64-$ORT_VERSION/lib").Path
+          $ortLib = (Resolve-Path "ort-dist/runtimes/win-x64/native").Path
           Write-Host "ORT_LIB_LOCATION=$ortLib"
           Add-Content -Path $env:GITHUB_ENV -Value "ORT_LIB_LOCATION=$ortLib"
           Add-Content -Path $env:GITHUB_ENV -Value "ORT_PREFER_DYNAMIC_LINK=1"
