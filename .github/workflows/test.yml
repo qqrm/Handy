@@ -6,8 +6,6 @@ on:
     paths:
       - "src-tauri/**"
   pull_request:
-    paths:
-      - "src-tauri/**"
 
 permissions:
   contents: read
