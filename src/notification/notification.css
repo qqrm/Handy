@@ -1,0 +1,82 @@
+:root {
+  font-family: Inter, "Segoe UI", system-ui, sans-serif;
+  color: #1e2530;
+  --notice-background: #fafbff;
+  --notice-border: #dce1e9;
+  --notice-muted: #505b6c;
+  --notice-accent: #8c5a08;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color: #f4f5fa;
+    --notice-background: #242731;
+    --notice-border: #454b5a;
+    --notice-muted: #c3c9d5;
+    --notice-accent: #f0be69;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  color: #f4f5fa;
+  --notice-background: #242731;
+  --notice-border: #454b5a;
+  --notice-muted: #c3c9d5;
+  --notice-accent: #f0be69;
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  user-select: none;
+}
+
+.notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  margin: 6px;
+  padding: 12px 20px;
+  min-height: 116px;
+  box-sizing: border-box;
+  border: 1px solid var(--notice-border);
+  border-radius: 14px;
+  background: var(--notice-background);
+  box-shadow: 0 2px 6px #00000018;
+}
+
+.notice.recording {
+  border-inline-start: 4px solid var(--notice-accent);
+}
+
+.notice-icon {
+  flex-shrink: 0;
+  color: var(--notice-accent);
+  margin-top: 2px;
+}
+
+.notice-copy {
+  min-width: 0;
+}
+
+.notice h1 {
+  font-size: 17px;
+  line-height: 1.3;
+  font-weight: 650;
+  margin: 0 0 8px;
+}
+
+.notice p {
+  color: var(--notice-muted);
+  font-size: 14px;
+  line-height: 1.45;
+  margin: 0;
+}

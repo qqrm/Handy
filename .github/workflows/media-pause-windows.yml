@@ -63,6 +63,13 @@ jobs:
         id: regression_evidence
         if: matrix.platform == 'ubuntu-24.04'
         run: python3 scripts/ci/recording_output_regressions.py --output "$RUNNER_TEMP/recording-output-evidence"
+      - name: Test dictation output ownership and reminder deadlines
+        if: matrix.platform == 'ubuntu-24.04'
+        run: |
+          cargo test --locked --manifest-path src-tauri/tests/dictation-output/Cargo.toml
+          cargo clippy --locked --manifest-path src-tauri/tests/dictation-output/Cargo.toml --all-targets -- -D warnings
+          rustc --edition=2021 --test src-tauri/src/recording_reminders_core.rs -o "$RUNNER_TEMP/recording-reminder-tests"
+          "$RUNNER_TEMP/recording-reminder-tests"
       - name: Preserve small regression receipts and assertion logs
         if: always() && matrix.platform == 'ubuntu-24.04' && steps.regression_evidence.outcome != 'skipped'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -222,6 +229,43 @@ jobs:
         run: cargo test --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml
       - name: Lint the Windows production-adapter harness
         run: cargo clippy --locked --manifest-path src-tauri/tests/media-pause/Cargo.toml --all-targets -- -D warnings
+      - name: Test pinned dictation against real Windows input controls
+        shell: pwsh
+        run: |
+          cargo test --locked --manifest-path src-tauri/tests/dictation-target/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw 'Dictation target unit tests failed' }
+          cargo test --locked --manifest-path src-tauri/tests/dictation-output/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw 'Dictation output unit tests failed' }
+          cargo clippy --locked --manifest-path src-tauri/tests/dictation-output/Cargo.toml --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'Dictation output Windows lint failed' }
+          $nativeTests = @(
+            'native_fixture::native_control_lifecycle_fixture',
+            'native_fixture::foreground_readback_fixture',
+            'native_fixture::deferred_capture_fixture',
+            'edge_fixture::edge_contenteditable_delivery_fixture'
+          )
+          foreach ($nativeTest in $nativeTests) {
+            $native = & cargo test --locked --manifest-path src-tauri/tests/dictation-target/Cargo.toml $nativeTest -- --exact --ignored --nocapture --test-threads=1 2>&1
+            $nativeExitCode = $LASTEXITCODE
+            $native | Write-Output
+            if ($nativeExitCode -ne 0 -or ($native -join "`n") -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') { throw "Native target fixture did not pass exactly once: $nativeTest" }
+          }
+          # A fresh process receives foreground activation eligibility from the
+          # runner. Reusing one process after destroying its last GUI thread can
+          # legitimately lose that eligibility before the next fixture starts.
+          $outputTests = @(
+            'windows_output::output_resolves_pending_capture_and_uses_frozen_settings',
+            'windows_output::pending_start_capture_never_follows_the_later_stop_focus',
+            'windows_output::output_captures_end_destination_before_recognition_only',
+            'windows_output::destroyed_target_keeps_the_complete_text_in_clipboard',
+            'windows_output::clipboard_stop_does_not_insert_or_submit_to_any_control'
+          )
+          foreach ($outputTest in $outputTests) {
+            $output = & cargo test --locked --manifest-path src-tauri/tests/dictation-output/Cargo.toml $outputTest -- --exact --ignored --nocapture --test-threads=1 2>&1
+            $outputExitCode = $LASTEXITCODE
+            $output | Write-Output
+            if ($outputExitCode -ne 0 -or ($output -join "`n") -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') { throw "Native output case did not pass exactly once: $outputTest" }
+          }
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri -> target

@@ -47,6 +47,7 @@ enum ManagerCommand {
     Register {
         binding_id: String,
         hotkey_string: String,
+        scope: Option<u64>,
         response: Sender<Result<(), String>>,
     },
     Unregister {
@@ -121,18 +122,19 @@ impl HandyKeysState {
 
         // Maps binding IDs to HotkeyIds and hotkey strings
         let mut binding_to_hotkey: HashMap<String, HotkeyId> = HashMap::new();
-        let mut hotkey_to_binding: HashMap<HotkeyId, (String, String)> = HashMap::new(); // (binding_id, hotkey_string)
+        let mut hotkey_to_binding: HashMap<HotkeyId, (String, String, Option<u64>)> =
+            HashMap::new(); // (binding_id, hotkey_string, recording scope)
 
         loop {
             // Check for hotkey events (non-blocking)
             while let Some(event) = manager.try_recv() {
-                if let Some((binding_id, hotkey_string)) = hotkey_to_binding.get(&event.id) {
+                if let Some((binding_id, hotkey_string, scope)) = hotkey_to_binding.get(&event.id) {
                     debug!(
                         "handy-keys event: binding={}, hotkey={}, state={:?}",
                         binding_id, hotkey_string, event.state
                     );
                     let is_pressed = event.state == HotkeyState::Pressed;
-                    handle_shortcut_event(&app, binding_id, hotkey_string, is_pressed);
+                    handle_shortcut_event(&app, binding_id, hotkey_string, is_pressed, *scope);
                 }
             }
 
@@ -142,6 +144,7 @@ impl HandyKeysState {
                     ManagerCommand::Register {
                         binding_id,
                         hotkey_string,
+                        scope,
                         response,
                     } => {
                         let result = Self::do_register(
@@ -150,6 +153,7 @@ impl HandyKeysState {
                             &mut hotkey_to_binding,
                             &binding_id,
                             &hotkey_string,
+                            scope,
                         );
                         let _ = response.send(result);
                     }
@@ -187,10 +191,14 @@ impl HandyKeysState {
     fn do_register(
         manager: &HotkeyManager,
         binding_to_hotkey: &mut HashMap<String, HotkeyId>,
-        hotkey_to_binding: &mut HashMap<HotkeyId, (String, String)>,
+        hotkey_to_binding: &mut HashMap<HotkeyId, (String, String, Option<u64>)>,
         binding_id: &str,
         hotkey_string: &str,
+        scope: Option<u64>,
     ) -> Result<(), String> {
+        if binding_to_hotkey.contains_key(binding_id) {
+            return Err(format!("Binding '{binding_id}' is already registered"));
+        }
         let hotkey: Hotkey = hotkey_string
             .parse()
             .map_err(|e| format!("Failed to parse hotkey '{}': {}", hotkey_string, e))?;
@@ -200,7 +208,10 @@ impl HandyKeysState {
             .map_err(|e| format!("Failed to register hotkey: {}", e))?;
 
         binding_to_hotkey.insert(binding_id.to_string(), id);
-        hotkey_to_binding.insert(id, (binding_id.to_string(), hotkey_string.to_string()));
+        hotkey_to_binding.insert(
+            id,
+            (binding_id.to_string(), hotkey_string.to_string(), scope),
+        );
 
         debug!(
             "Registered handy-keys shortcut: {} -> {:?}",
@@ -213,13 +224,14 @@ impl HandyKeysState {
     fn do_unregister(
         manager: &HotkeyManager,
         binding_to_hotkey: &mut HashMap<String, HotkeyId>,
-        hotkey_to_binding: &mut HashMap<HotkeyId, (String, String)>,
+        hotkey_to_binding: &mut HashMap<HotkeyId, (String, String, Option<u64>)>,
         binding_id: &str,
     ) -> Result<(), String> {
-        if let Some(id) = binding_to_hotkey.remove(binding_id) {
+        if let Some(&id) = binding_to_hotkey.get(binding_id) {
             manager
                 .unregister(id)
                 .map_err(|e| format!("Failed to unregister hotkey: {}", e))?;
+            binding_to_hotkey.remove(binding_id);
             hotkey_to_binding.remove(&id);
             debug!("Unregistered handy-keys shortcut: {}", binding_id);
         }
@@ -228,6 +240,10 @@ impl HandyKeysState {
 
     /// Register a shortcut binding
     pub fn register(&self, binding: &ShortcutBinding) -> Result<(), String> {
+        self.register_scoped(binding, None)
+    }
+
+    fn register_scoped(&self, binding: &ShortcutBinding, scope: Option<u64>) -> Result<(), String> {
         let (tx, rx) = mpsc::channel();
         self.command_sender
             .lock()
@@ -235,6 +251,7 @@ impl HandyKeysState {
             .send(ManagerCommand::Register {
                 binding_id: binding.id.clone(),
                 hotkey_string: binding.current_binding.clone(),
+                scope,
                 response: tx,
             })
             .map_err(|_| "Failed to send register command")?;
@@ -428,9 +445,9 @@ pub fn init_shortcuts(app: &AppHandle) -> Result<(), String> {
     let default_bindings = settings::get_default_settings().bindings;
     let user_settings = settings::load_or_create_app_settings(app);
 
-    // Register all bindings except cancel (which is dynamic)
+    // Recording-only bindings are registered by the scoped lifecycle worker.
     for (id, default_binding) in default_bindings {
-        if id == "cancel" {
+        if super::is_recording_binding(&id) {
             continue;
         }
         // Skip post-processing shortcut when the feature is disabled
@@ -457,57 +474,25 @@ pub fn init_shortcuts(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Register the cancel shortcut (called when recording starts)
-pub fn register_cancel_shortcut(app: &AppHandle) {
-    // Disabled on Linux due to instability
-    #[cfg(target_os = "linux")]
-    {
-        let _ = app;
-        return;
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let app_clone = app.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Some(cancel_binding) = get_settings(&app_clone).bindings.get("cancel").cloned() {
-                if let Some(state) = app_clone.try_state::<HandyKeysState>() {
-                    if let Err(e) = state.register(&cancel_binding) {
-                        error!("Failed to register cancel shortcut: {}", e);
-                    }
-                }
-            }
-        });
-    }
-}
-
-/// Unregister the cancel shortcut (called when recording stops)
-pub fn unregister_cancel_shortcut(app: &AppHandle) {
-    #[cfg(target_os = "linux")]
-    {
-        let _ = app;
-        return;
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let app_clone = app.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Some(cancel_binding) = get_settings(&app_clone).bindings.get("cancel").cloned() {
-                if let Some(state) = app_clone.try_state::<HandyKeysState>() {
-                    let _ = state.unregister(&cancel_binding);
-                }
-            }
-        });
-    }
-}
-
 /// Register a shortcut
 pub fn register_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<(), String> {
+    let scope = if super::is_recording_binding(&binding.id) {
+        Some(super::recording_shortcut_scope(app).ok_or("Recording shortcut is inactive")?)
+    } else {
+        None
+    };
+    register_scoped_shortcut(app, binding, scope)
+}
+
+pub(super) fn register_scoped_shortcut(
+    app: &AppHandle,
+    binding: ShortcutBinding,
+    scope: Option<u64>,
+) -> Result<(), String> {
     let state = app
         .try_state::<HandyKeysState>()
         .ok_or("HandyKeysState not initialized")?;
-    state.register(&binding)
+    state.register_scoped(&binding, scope)
 }
 
 /// Unregister a shortcut

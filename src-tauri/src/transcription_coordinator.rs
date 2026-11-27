@@ -1,4 +1,5 @@
 use crate::actions::ACTION_MAP;
+use crate::dictation_output::OutputMode;
 use crate::settings::ShortcutActivation;
 use log::{debug, error, warn};
 use std::sync::mpsc::{self, Sender};
@@ -164,11 +165,17 @@ enum Effect {
         binding_id: String,
         hotkey_string: String,
     },
+    StopToClipboard {
+        binding_id: String,
+        hotkey_string: String,
+    },
 }
 
 /// Commands processed sequentially by the coordinator thread.
 enum Command {
     Input(InputEvent),
+    FinishToClipboard(String, u64),
+    CancelRecording(u64),
     Cancel,
     CancellationFinished,
     ProcessingFinished,
@@ -482,6 +489,21 @@ impl CoordinatorState {
         None
     }
 
+    /// Alternative completion is accepted only while recording. In particular
+    /// it cannot rewrite a stop already queued for transcription, or start one.
+    fn on_finish_to_clipboard(&mut self, hotkey_string: String) -> Option<Effect> {
+        let Stage::Recording(binding_id) = &self.stage else {
+            return None;
+        };
+        let binding_id = binding_id.clone();
+        self.pending_release = None;
+        self.begin_processing(binding_id.clone(), hotkey_string.clone());
+        Some(Effect::StopToClipboard {
+            binding_id,
+            hotkey_string,
+        })
+    }
+
     /// Returns whether a cleanup worker must be started. Repeated cancellation
     /// still clears remembered input but shares the existing worker.
     fn on_cancel(&mut self) -> bool {
@@ -599,6 +621,7 @@ impl TranscriptionCoordinator {
                                 if let Some(effect) = state.on_grace_expired() {
                                     run_effect(&app, &mut state, effect);
                                 }
+                                sync_recording_lock(&app, &state);
                                 continue;
                             }
                             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -686,6 +709,24 @@ impl TranscriptionCoordinator {
         }
     }
 
+    /// Finish the currently recording action, preserving its post-processing
+    /// choice, but fixing the output to clipboard before recognition starts.
+    pub fn finish_to_clipboard(&self, hotkey_string: &str, scope: u64) {
+        if self
+            .tx
+            .send(Command::FinishToClipboard(hotkey_string.to_string(), scope))
+            .is_err()
+        {
+            warn!("Transcription coordinator channel closed");
+        }
+    }
+
+    pub fn cancel_recording(&self, scope: u64) {
+        if self.tx.send(Command::CancelRecording(scope)).is_err() {
+            warn!("Transcription coordinator channel closed");
+        }
+    }
+
     pub fn notify_processing_finished(&self) {
         if self.tx.send(Command::ProcessingFinished).is_err() {
             warn!("Transcription coordinator channel closed");
@@ -705,7 +746,21 @@ fn dispatch_command(
                 run_effect(app, state, effect);
             }
         }
+        Command::FinishToClipboard(hotkey_string, scope) => {
+            if recording_command_is_current(app, state, scope) {
+                if let Some(effect) = state.on_finish_to_clipboard(hotkey_string) {
+                    run_effect(app, state, effect);
+                }
+            }
+        }
+        Command::CancelRecording(scope) => {
+            if recording_command_is_current(app, state, scope) {
+                dispatch_command(app, state, Command::Cancel, cancellation_tx);
+            }
+        }
         Command::Cancel => {
+            crate::recording_reminders::stop(app);
+            crate::dictation_output::cancel(app);
             if state.on_cancel() {
                 let app = app.clone();
                 spawn_cancellation(cancellation_tx.clone(), move || {
@@ -724,6 +779,20 @@ fn dispatch_command(
             }
         }
     }
+    sync_recording_lock(app, state);
+}
+
+fn sync_recording_lock(app: &AppHandle, state: &CoordinatorState) {
+    if matches!(state.stage, Stage::Recording(_)) && state.is_locked() {
+        crate::recording_reminders::lock(app);
+    }
+}
+
+/// Revalidate on the serialized lifecycle thread. The callback's earlier check
+/// cannot authorize a command delayed until after a different recording starts.
+fn recording_command_is_current(app: &AppHandle, state: &CoordinatorState, scope: u64) -> bool {
+    matches!(state.stage, Stage::Recording(_))
+        && crate::shortcut::recording_shortcut_scope(app) == Some(scope)
 }
 
 fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
@@ -732,13 +801,23 @@ fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
             binding_id,
             hotkey_string,
         } => {
+            crate::dictation_output::begin(app);
             let started = start(app, &binding_id, &hotkey_string);
             state.on_start_result(&binding_id, started);
+            if started {
+                crate::recording_reminders::start(app, state.is_locked());
+            } else {
+                crate::dictation_output::cancel(app);
+            }
         }
         Effect::Stop {
             binding_id,
             hotkey_string,
-        } => stop(app, &binding_id, &hotkey_string),
+        } => stop(app, &binding_id, &hotkey_string, OutputMode::Insert),
+        Effect::StopToClipboard {
+            binding_id,
+            hotkey_string,
+        } => stop(app, &binding_id, &hotkey_string, OutputMode::ClipboardOnly),
     }
 }
 
@@ -756,7 +835,9 @@ fn start(app: &AppHandle, binding_id: &str, hotkey_string: &str) -> bool {
     recording
 }
 
-fn stop(app: &AppHandle, binding_id: &str, hotkey_string: &str) {
+fn stop(app: &AppHandle, binding_id: &str, hotkey_string: &str, mode: OutputMode) {
+    crate::recording_reminders::stop(app);
+    crate::dictation_output::prepare_stop(app, mode);
     let Some(action) = ACTION_MAP.get(binding_id) else {
         warn!("No action in ACTION_MAP for '{binding_id}'");
         return;
@@ -767,6 +848,66 @@ fn stop(app: &AppHandle, binding_id: &str, hotkey_string: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_stop_is_an_alternative_completion_not_a_new_recording() {
+        let mut state = CoordinatorState::new();
+        assert!(state.on_finish_to_clipboard("ctrl+escape".into()).is_none());
+        state.begin_recording(
+            "transcribe_with_post_process".into(),
+            "ctrl+shift+space".into(),
+            Instant::now(),
+            true,
+        );
+        assert_eq!(
+            state.on_finish_to_clipboard("ctrl+escape".into()),
+            Some(Effect::StopToClipboard {
+                binding_id: "transcribe_with_post_process".into(),
+                hotkey_string: "ctrl+escape".into(),
+            })
+        );
+        assert_eq!(state.stage, Stage::Processing);
+        assert!(state.processing_pending);
+        assert!(state.on_finish_to_clipboard("ctrl+escape".into()).is_none());
+        assert!(state.on_processing_finished().is_none());
+        assert_eq!(state.stage, Stage::Idle);
+    }
+
+    #[test]
+    fn clipboard_stop_cannot_rewrite_a_normal_stop_already_processing() {
+        let mut state = CoordinatorState::new();
+        state.begin_recording(
+            "transcribe".into(),
+            "ctrl+space".into(),
+            Instant::now(),
+            true,
+        );
+        assert!(matches!(
+            state.begin_processing("transcribe".into(), "ctrl+space".into()),
+            Effect::Stop { .. }
+        ));
+        assert!(state.on_finish_to_clipboard("ctrl+escape".into()).is_none());
+        assert!(state.pending_press.is_none());
+    }
+
+    #[test]
+    fn clipboard_stop_clears_a_deferred_key_release() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+        state.on_input(ptt_input(true), now);
+        state.on_input(ptt_input(false), now + Duration::from_millis(100));
+        assert!(state.grace_deadline().is_some());
+        assert!(matches!(
+            state.on_finish_to_clipboard("ctrl+escape".into()),
+            Some(Effect::StopToClipboard { .. })
+        ));
+        assert!(state.grace_deadline().is_none());
+        assert!(state.on_grace_expired().is_none());
+        assert!(state
+            .on_input(ptt_input(false), now + Duration::from_millis(120))
+            .is_none());
+        assert!(state.pending_press.is_none());
+    }
 
     #[test]
     fn push_to_talk_release_while_recording_defers_release() {
@@ -974,7 +1115,7 @@ mod tests {
             };
             match effect {
                 Some(Effect::Start { .. }) => starts += 1,
-                Some(Effect::Stop { .. }) => stops += 1,
+                Some(Effect::Stop { .. } | Effect::StopToClipboard { .. }) => stops += 1,
                 None => {}
             }
         }

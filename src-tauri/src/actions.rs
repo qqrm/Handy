@@ -647,6 +647,7 @@ impl ShortcutAction for TranscribeAction {
     }
 
     fn stop(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+        let output = crate::dictation_output::take(app);
         // The coordinator has already entered Processing. Cancellation can
         // remove the recording before we obtain its token, so even that early
         // return must signal pipeline completion. The coordinator also waits
@@ -838,7 +839,7 @@ impl ShortcutAction for TranscribeAction {
                                 let paste_time = Instant::now();
                                 let final_text = processed.final_text;
                                 let rm_for_paste = Arc::clone(&rm);
-                                ah.run_on_main_thread(move || {
+                                let deliver = move || {
                                     if rm_for_paste.was_cancelled_since(cancel_generation) {
                                         debug!("Transcription operation cancelled before paste");
                                         utils::hide_recording_overlay(&ah_clone);
@@ -846,9 +847,11 @@ impl ShortcutAction for TranscribeAction {
                                         return;
                                     }
 
-                                    match utils::paste(final_text, ah_clone.clone()) {
+                                    match crate::dictation_output::deliver(
+                                        output, &ah_clone, final_text,
+                                    ) {
                                         Ok(()) => debug!(
-                                            "Text pasted successfully in {:?}",
+                                            "Dictation output completed in {:?}",
                                             paste_time.elapsed()
                                         ),
                                         Err(e) => {
@@ -858,12 +861,38 @@ impl ShortcutAction for TranscribeAction {
                                     }
                                     utils::hide_recording_overlay(&ah_clone);
                                     set_tray_state(&ah_clone, TrayIconState::Idle);
-                                })
-                                .unwrap_or_else(|e| {
-                                    error!("Failed to run paste on main thread: {:?}", e);
-                                    utils::hide_recording_overlay(&ah);
-                                    set_tray_state(&ah, TrayIconState::Idle);
-                                });
+                                };
+                                #[cfg(windows)]
+                                {
+                                    // Slow accessibility providers must not freeze
+                                    // the UI. Await delivery before releasing the
+                                    // coordinator's ownership of this recording.
+                                    if let Err(e) =
+                                        tauri::async_runtime::spawn_blocking(deliver).await
+                                    {
+                                        error!("Dictation output worker failed: {e}");
+                                        utils::hide_recording_overlay(&ah);
+                                        set_tray_state(&ah, TrayIconState::Idle);
+                                    }
+                                }
+                                #[cfg(not(windows))]
+                                {
+                                    let (output_done, output_finished) =
+                                        tokio::sync::oneshot::channel::<()>();
+                                    let queued = ah.run_on_main_thread(move || {
+                                        let _completion = output_done;
+                                        deliver();
+                                    });
+                                    if let Err(e) = queued {
+                                        error!("Failed to run paste on main thread: {e:?}");
+                                        utils::hide_recording_overlay(&ah);
+                                        set_tray_state(&ah, TrayIconState::Idle);
+                                    } else {
+                                        // Dropping the sender acknowledges every
+                                        // path, including cancellation in the closure.
+                                        let _ = output_finished.await;
+                                    }
+                                }
                             }
                         }
                         Err(err) => {

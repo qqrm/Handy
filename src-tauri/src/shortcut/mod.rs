@@ -11,6 +11,8 @@
 
 mod handler;
 pub mod handy_keys;
+mod recording_scope;
+mod recording_shortcuts;
 pub mod tauri_impl;
 
 use log::{debug, error, info, warn};
@@ -55,28 +57,24 @@ pub fn init_shortcuts(app: &AppHandle) {
     }
 }
 
-/// Register the cancel shortcut (called when recording starts)
+/// Register recording-only Cancel and Finish-to-clipboard bindings.
 pub fn register_cancel_shortcut(app: &AppHandle) {
-    // Track recording lifecycle independently of the current implementation so
-    // switching implementations mid-recording cannot leave stale fallback state.
+    recording_shortcuts::start(app);
     crate::secure_input::register_cancel_fallback(app);
-
-    let settings = get_settings(app);
-    match settings.keyboard_implementation {
-        KeyboardImplementation::Tauri => tauri_impl::register_cancel_shortcut(app),
-        KeyboardImplementation::HandyKeys => handy_keys::register_cancel_shortcut(app),
-    }
 }
 
-/// Unregister the cancel shortcut (called when recording stops)
+/// Invalidate callbacks immediately, then remove their exact registrations.
 pub fn unregister_cancel_shortcut(app: &AppHandle) {
+    recording_shortcuts::stop(app);
     crate::secure_input::unregister_cancel_fallback(app);
+}
 
-    let settings = get_settings(app);
-    match settings.keyboard_implementation {
-        KeyboardImplementation::Tauri => tauri_impl::unregister_cancel_shortcut(app),
-        KeyboardImplementation::HandyKeys => handy_keys::unregister_cancel_shortcut(app),
-    }
+pub(crate) fn is_recording_binding(id: &str) -> bool {
+    recording_shortcuts::is_recording_binding(id)
+}
+
+pub(crate) fn recording_shortcut_scope(app: &AppHandle) -> Option<u64> {
+    recording_shortcuts::current_scope(app)
 }
 
 /// Register a shortcut using the appropriate implementation
@@ -149,21 +147,23 @@ pub fn change_binding(
         }
     };
 
-    // If this is the cancel binding, just update the settings and return
-    // It's managed dynamically, so we don't register/unregister here
-    if id == "cancel" {
-        if let Some(mut b) = settings.bindings.get(&id).cloned() {
-            b.current_binding = binding;
-            settings.bindings.insert(id.clone(), b.clone());
-            settings::write_settings(&app, settings);
-            crate::secure_input::reconcile_fallback(&app);
-            return Ok(BindingResponse {
-                success: true,
-                binding: Some(b.clone()),
-                error: None,
-            });
-        }
+    // Recording-only shortcuts are never registered by an idle settings edit.
+    if is_recording_binding(&id) {
+        validate_shortcut_for_implementation(&binding, settings.keyboard_implementation)?;
+        reject_duplicate_binding(&settings, &id, &binding)?;
+        let mut updated_binding = binding_to_modify;
+        updated_binding.current_binding = binding;
+        settings.bindings.insert(id, updated_binding.clone());
+        settings::write_settings(&app, settings);
+        recording_shortcuts::refresh(&app);
+        crate::secure_input::reconcile_fallback(&app);
+        return Ok(BindingResponse {
+            success: true,
+            binding: Some(updated_binding),
+            error: None,
+        });
     }
+    reject_duplicate_binding(&settings, &id, &binding)?;
 
     // Unregister the existing binding
     if let Err(e) = unregister_shortcut(&app, binding_to_modify.clone()) {
@@ -210,6 +210,27 @@ pub fn change_binding(
     })
 }
 
+fn reject_duplicate_binding(
+    settings: &settings::AppSettings,
+    id: &str,
+    raw: &str,
+) -> Result<(), String> {
+    let candidate = raw.parse::<::handy_keys::Hotkey>().ok();
+    if settings.bindings.iter().any(|(other_id, other)| {
+        other_id != id
+            && match (
+                candidate.as_ref(),
+                other.current_binding.parse::<::handy_keys::Hotkey>(),
+            ) {
+                (Some(candidate), Ok(other)) => candidate == &other,
+                _ => raw.eq_ignore_ascii_case(&other.current_binding),
+            }
+    }) {
+        return Err("Shortcut is already assigned to another Handy action".to_string());
+    }
+    Ok(())
+}
+
 /// Best-effort re-register of the previous binding after a failed change,
 /// so a failure leaves the user's shortcut working exactly as before.
 fn restore_registration(app: &AppHandle, binding: &ShortcutBinding) {
@@ -230,11 +251,13 @@ pub fn reset_binding(app: AppHandle, id: String) -> Result<BindingResponse, Stri
 
 /// Unregister every binding while the user is recording a new shortcut in
 /// the UI, so no existing shortcut can fire — or swallow the keystrokes —
-/// mid-capture. The "cancel" binding is untouched: it is managed dynamically
-/// by the recording lifecycle.
+/// mid-capture. Recording-only bindings are invalidated immediately and
+/// removed by their serialized registration worker.
 pub fn suspend_all_shortcuts(app: &AppHandle) {
+    recording_shortcuts::suspend(app);
+    crate::secure_input::reconcile_fallback(app);
     for (id, binding) in settings::get_bindings(app) {
-        if id == "cancel" {
+        if is_recording_binding(&id) {
             continue;
         }
         if let Err(e) = unregister_shortcut(app, binding) {
@@ -250,9 +273,11 @@ pub fn suspend_all_shortcuts(app: &AppHandle) {
 /// Registering an already-registered shortcut fails cleanly in both
 /// implementations, so this is idempotent and safe on every exit path.
 pub fn resume_all_shortcuts(app: &AppHandle) {
+    recording_shortcuts::resume(app);
+    crate::secure_input::reconcile_fallback(app);
     let settings = get_settings(app);
     for (id, binding) in &settings.bindings {
-        if id == "cancel" {
+        if is_recording_binding(id) {
             continue;
         }
         if id == "transcribe_with_post_process" && !settings.post_process_enabled {
@@ -320,6 +345,8 @@ pub fn change_keyboard_implementation_setting(
         current_impl, new_impl
     );
 
+    recording_shortcuts::suspend(&app);
+
     // Unregister all shortcuts from the current implementation
     unregister_all_shortcuts(&app, current_impl);
 
@@ -335,8 +362,21 @@ pub fn change_keyboard_implementation_setting(
     }
 
     // Initialize new implementation if needed (HandyKeys needs state)
-    if new_impl == KeyboardImplementation::HandyKeys && initialize_handy_keys_with_rollback(&app)? {
+    let initialized_handy_keys = if new_impl == KeyboardImplementation::HandyKeys {
+        match initialize_handy_keys_with_rollback(&app) {
+            Ok(initialized) => initialized,
+            Err(error) => {
+                recording_shortcuts::resume(&app);
+                crate::secure_input::reconcile_fallback(&app);
+                return Err(error);
+            }
+        }
+    } else {
+        false
+    };
+    if initialized_handy_keys {
         // Shortcuts already registered during init.
+        recording_shortcuts::resume(&app);
         crate::secure_input::reconcile_fallback(&app);
         return Ok(ImplementationChangeResult {
             success: true,
@@ -346,6 +386,7 @@ pub fn change_keyboard_implementation_setting(
 
     // Register all shortcuts with new implementation, resetting invalid ones
     let reset_bindings = register_all_shortcuts_for_implementation(&app, new_impl);
+    recording_shortcuts::resume(&app);
     crate::secure_input::reconcile_fallback(&app);
 
     // Emit event to notify frontend of the change
@@ -412,8 +453,8 @@ fn unregister_all_shortcuts(app: &AppHandle, implementation: KeyboardImplementat
     let bindings = settings::get_bindings(app);
 
     for (id, binding) in bindings {
-        // Skip cancel shortcut as it's dynamically registered
-        if id == "cancel" {
+        // Recording-only bindings are owned by the scoped registration worker.
+        if is_recording_binding(&id) {
             continue;
         }
 
@@ -441,8 +482,8 @@ fn register_all_shortcuts_for_implementation(
     let mut current_settings = settings::get_settings(app);
 
     for (id, default_binding) in &default_bindings {
-        // Skip cancel shortcut as it's dynamically registered
-        if id == "cancel" {
+        // Recording-only bindings are owned by the scoped registration worker.
+        if is_recording_binding(id) {
             continue;
         }
 
@@ -1434,7 +1475,7 @@ pub async fn get_available_accelerators() -> crate::managers::transcription::Ava
 
 #[cfg(test)]
 mod tests {
-    use handy_keys::Hotkey;
+    use ::handy_keys::{Hotkey, Modifiers};
     use tauri_plugin_global_shortcut::Shortcut;
 
     #[test]
@@ -1450,5 +1491,46 @@ mod tests {
             assert!(key.parse::<Shortcut>().is_ok(), "Tauri rejected {key}");
             assert!(key.parse::<Hotkey>().is_ok(), "HandyKeys rejected {key}");
         }
+    }
+
+    #[test]
+    fn clipboard_stop_and_cancel_match_different_modifier_states() {
+        let cancel: Hotkey = "escape".parse().unwrap();
+        let clipboard: Hotkey = "ctrl+escape".parse().unwrap();
+        assert_eq!(cancel.key, clipboard.key);
+        for control in [Modifiers::CTRL_LEFT, Modifiers::CTRL_RIGHT] {
+            assert!(clipboard.modifiers.matches(control));
+            assert!(!cancel.modifiers.matches(control));
+        }
+        assert!(cancel.modifiers.matches(Modifiers::empty()));
+        assert!(!clipboard.modifiers.matches(Modifiers::empty()));
+        assert!(!clipboard
+            .modifiers
+            .matches(Modifiers::CTRL_LEFT | Modifiers::SHIFT_LEFT));
+    }
+
+    #[test]
+    fn recording_only_bindings_cannot_shadow_the_start_or_cancel_action() {
+        let settings = crate::settings::get_default_settings();
+        assert!(super::reject_duplicate_binding(
+            &settings,
+            "transcribe_to_clipboard",
+            &settings.bindings["transcribe"].current_binding,
+        )
+        .is_err());
+        assert!(
+            super::reject_duplicate_binding(&settings, "transcribe_to_clipboard", "Escape")
+                .is_err()
+        );
+        assert!(super::reject_duplicate_binding(
+            &settings,
+            "transcribe_to_clipboard",
+            "ctrl+shift+f12",
+        )
+        .is_ok());
+        assert!(super::is_recording_binding("transcribe_to_clipboard"));
+        assert!(super::is_recording_binding("cancel"));
+        assert!(!super::is_recording_binding("transcribe"));
+        assert!(!super::is_recording_binding("transcribe_with_post_process"));
     }
 }

@@ -3,10 +3,12 @@
 
 Compiles the whole coordinator module and its real unit tests, unchanged audio
 manager lifecycle methods, TranscribeAction::start, centralized cancellation,
-FinishGuard, and Stop's entry through its no-token return. Speech transcription
-after a successful Stop token is deliberately outside this fixture. Tauri,
-microphone/model/UI services and output backends are fakes; this is not hardware
-or a full Tauri application test. Source mutations run only in temporary copies.
+FinishGuard, Stop's token-acquisition entry and the output selection policy.
+After a successful Stop token, an explicitly fake ASR boundary records the
+frozen output mode and original post-processing action, then completes real
+capture cleanup. Tauri, microphone/model/UI services and reminder/output hooks
+are fakes; this is not speech recognition, native delivery, hardware or a full
+Tauri application test. Source mutations run only in temporary copies.
 """
 
 from __future__ import annotations
@@ -29,6 +31,8 @@ COORDINATOR = "src-tauri/src/transcription_coordinator.rs"
 AUDIO = "src-tauri/src/managers/audio.rs"
 ACTIONS = "src-tauri/src/actions.rs"
 UTILS = "src-tauri/src/utils.rs"
+OUTPUT_POLICY = "src-tauri/src/dictation_output/policy.rs"
+RECORDING_SCOPE = "src-tauri/src/shortcut/recording_scope.rs"
 AUDIO_METHODS = (
     "set_state", "try_start_recording", "request_recording_stop",
     "invalidate_recording_readiness", "is_recording_readiness_current",
@@ -39,8 +43,20 @@ RUNTIME_CASES = (
     "transcription_coordinator::runtime_tests::no_token_stop_waits_for_real_capture_and_full_cancel_cleanup",
     "transcription_coordinator::runtime_tests::actual_failed_start_does_not_claim_an_older_active_capture",
     "transcription_coordinator::runtime_tests::repeated_cancel_uses_one_worker_and_discards_queued_restart",
+    "transcription_coordinator::runtime_tests::clipboard_stop_freezes_policy_before_instant_recognition_and_preserves_postprocess",
+    "transcription_coordinator::runtime_tests::clipboard_shortcut_is_inert_while_idle_and_after_normal_stop",
+    "transcription_coordinator::runtime_tests::clipboard_stop_discards_the_old_release_before_a_fast_new_recording",
+    "transcription_coordinator::runtime_tests::reminder_hooks_distinguish_holding_tapping_and_cancellation",
+    "transcription_coordinator::runtime_tests::queued_old_recording_shortcuts_cannot_stop_or_cancel_the_next_recording",
 )
 MUTATIONS = (
+    {
+        "name": "queued_recording_shortcut_loses_its_scope",
+        "before": "&& crate::shortcut::recording_shortcut_scope(app) == Some(scope)",
+        "after": "&& { let _ = scope; true }",
+        "test": RUNTIME_CASES[7],
+        "marker": "REGRESSION: a queued old recording shortcut affected the next recording",
+    },
     {
         "name": "pipeline_completion_ignores_cancellation_cleanup",
         "before": "if self.processing_pending || self.cancellation_pending {",
@@ -71,6 +87,27 @@ MUTATIONS = (
         "test": "transcription_coordinator::tests::repeated_cancellation_shares_cleanup_and_discards_the_abandoned_press",
         "marker": "an existing worker already owns cleanup",
     },
+    {
+        "name": "clipboard_completion_inserts_instead_of_copying",
+        "before": "} => stop(app, &binding_id, &hotkey_string, OutputMode::ClipboardOnly),",
+        "after": "} => stop(app, &binding_id, &hotkey_string, OutputMode::Insert),",
+        "test": RUNTIME_CASES[3],
+        "marker": "REGRESSION: clipboard completion changed its output policy or original action",
+    },
+    {
+        "name": "clipboard_completion_keeps_the_previous_release",
+        "before": "let binding_id = binding_id.clone();\n        self.pending_release = None;",
+        "after": "let binding_id = binding_id.clone();",
+        "test": RUNTIME_CASES[5],
+        "marker": "REGRESSION: the previous release swallowed the next recording's Start",
+    },
+    {
+        "name": "cancellation_omits_recording_reminder_stop",
+        "before": "Command::Cancel => {\n            crate::recording_reminders::stop(app);",
+        "after": "Command::Cancel => {",
+        "test": RUNTIME_CASES[6],
+        "marker": "REGRESSION: cancellation left recording reminders running",
+    },
 )
 
 
@@ -85,7 +122,7 @@ def build_fixture(sources: dict[str, str]) -> tuple[str, dict[str, str]]:
     audio, actions = sources[AUDIO], sources[ACTIONS]
     transcribe = block(actions, "impl ShortcutAction for TranscribeAction")
     stop = function_source(transcribe, "stop")
-    stop_boundary = "        // Unregister the cancel shortcut when transcription stops"
+    stop_boundary = "        let stop_time = Instant::now();"
     if stop.count(stop_boundary) != 1:
         raise RuntimeError("Could not delimit the production no-token Stop entry")
     stop_entry = stop[:stop.index(stop_boundary)]
@@ -94,6 +131,8 @@ def build_fixture(sources: dict[str, str]) -> tuple[str, dict[str, str]]:
 
     fragments = {
         "PRODUCTION_COORDINATOR": sources[COORDINATOR],
+        "PRODUCTION_OUTPUT_POLICY": sources[OUTPUT_POLICY],
+        "PRODUCTION_RECORDING_SCOPE": sources[RECORDING_SCOPE],
         "PRODUCTION_RECORDING_TYPES": "\n\n".join((
             "#[derive(Clone, Debug)]\n" + block(audio, "pub enum RecordingState"),
             "#[derive(Clone, Debug)]\n" + block(audio, "pub enum MicrophoneMode"),
@@ -113,7 +152,7 @@ def build_fixture(sources: dict[str, str]) -> tuple[str, dict[str, str]]:
         "PRODUCTION_ACTION_TRAIT": block(actions, "pub trait ShortcutAction"),
         "PRODUCTION_ACTION_START": function_source(transcribe, "start"),
         "PRODUCTION_STOP_FUNCTION": stop_entry +
-            '        panic!("this fixture executes only Stop\'s production no-token return");\n    }',
+            "        finish_at_fake_asr_boundary(app, binding_id, generation, self.post_process, output);\n    }",
     }
     fixture = (ROOT / "scripts/ci/coordinator_lifecycle_fixture.rs").read_text()
     for name, fragment in fragments.items():
@@ -125,7 +164,10 @@ def build_fixture(sources: dict[str, str]) -> tuple[str, dict[str, str]]:
 
 
 def verify(rustc: str, evidence: Path) -> dict:
-    sources = {path: (ROOT / path).read_text() for path in (COORDINATOR, AUDIO, ACTIONS, UTILS)}
+    sources = {
+        path: (ROOT / path).read_text()
+        for path in (COORDINATOR, AUDIO, ACTIONS, UTILS, OUTPUT_POLICY, RECORDING_SCOPE)
+    }
     fixture, fragment_hashes = build_fixture(sources)
     generated = evidence / "coordinator-production-bodies.rs"
     generated.write_text(fixture)
@@ -145,7 +187,12 @@ def verify(rustc: str, evidence: Path) -> dict:
         )
         output = run([str(binary), "--test-threads=1"], ROOT, evidence / "coordinator-all-tests.log")
         result["all_tests"] = dict(run.last_result)
-        expected = sources[COORDINATOR].count("#[test]") + len(RUNTIME_CASES)
+        expected = (
+            sources[COORDINATOR].count("#[test]")
+            + sources[OUTPUT_POLICY].count("#[test]")
+            + sources[RECORDING_SCOPE].count("#[test]")
+            + len(RUNTIME_CASES)
+        )
         summary = rf"^test result: ok\. {expected} passed; 0 failed; 0 ignored;"
         if result["all_tests"]["exit_code"] != 0 or not re.search(summary, output, re.MULTILINE):
             raise RuntimeError(f"Expected {expected} production coordinator/runtime tests: {evidence / 'coordinator-all-tests.log'}")

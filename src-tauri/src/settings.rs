@@ -156,6 +156,29 @@ pub enum PasteMethod {
     ExternalScript,
 }
 
+/// The instant whose focused field and selection receive this dictation.
+/// Pinned delivery is currently implemented on Windows.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DictationTarget {
+    #[default]
+    RecordingStart,
+    RecordingEnd,
+}
+
+pub const MIN_RECORDING_REMINDER_MINUTES: u32 = 1;
+pub const MAX_RECORDING_REMINDER_MINUTES: u32 = 120;
+
+pub fn validate_recording_reminder_minutes(minutes: u32) -> Result<(), String> {
+    if (MIN_RECORDING_REMINDER_MINUTES..=MAX_RECORDING_REMINDER_MINUTES).contains(&minutes) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Reminder interval must be between {MIN_RECORDING_REMINDER_MINUTES} and {MAX_RECORDING_REMINDER_MINUTES} minutes"
+        ))
+    }
+}
+
 /// How the transcribe shortcut's key events drive a recording.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type, Default)]
 #[serde(rename_all = "snake_case")]
@@ -380,6 +403,16 @@ pub struct AppSettings {
     #[serde(default = "default_hold_threshold_ms")]
     pub hold_threshold_ms: u64,
     #[serde(default)]
+    pub dictation_target: DictationTarget,
+    #[serde(default = "default_notify_delivery_failure")]
+    pub notify_delivery_failure: bool,
+    #[serde(default)]
+    pub recording_reminders_enabled: bool,
+    #[serde(default = "default_recording_reminder_minutes")]
+    pub recording_reminder_minutes: u32,
+    #[serde(default)]
+    pub recording_reminder_sound: bool,
+    #[serde(default)]
     pub audio_feedback: bool,
     #[serde(default = "default_audio_feedback_volume")]
     pub audio_feedback_volume: f32,
@@ -562,6 +595,14 @@ fn default_whats_new_last_seen_version() -> String {
 
 fn default_selected_language() -> String {
     "auto".to_string()
+}
+
+fn default_notify_delivery_failure() -> bool {
+    true
+}
+
+fn default_recording_reminder_minutes() -> u32 {
+    MIN_RECORDING_REMINDER_MINUTES
 }
 
 fn default_overlay_position() -> OverlayPosition {
@@ -898,6 +939,21 @@ pub fn get_default_settings() -> AppSettings {
             current_binding: default_post_process_shortcut.to_string(),
         },
     );
+    #[cfg(target_os = "macos")]
+    let default_clipboard_stop_shortcut = "cmd+escape";
+    #[cfg(not(target_os = "macos"))]
+    let default_clipboard_stop_shortcut = "ctrl+escape";
+    bindings.insert(
+        "transcribe_to_clipboard".to_string(),
+        ShortcutBinding {
+            id: "transcribe_to_clipboard".to_string(),
+            name: "Finish to clipboard".to_string(),
+            description: "Stops recording, transcribes and copies the result without inserting or submitting it."
+                .to_string(),
+            default_binding: default_clipboard_stop_shortcut.to_string(),
+            current_binding: default_clipboard_stop_shortcut.to_string(),
+        },
+    );
     bindings.insert(
         "cancel".to_string(),
         ShortcutBinding {
@@ -914,6 +970,11 @@ pub fn get_default_settings() -> AppSettings {
         bindings,
         shortcut_activation: ShortcutActivation::default(),
         hold_threshold_ms: default_hold_threshold_ms(),
+        dictation_target: DictationTarget::default(),
+        notify_delivery_failure: default_notify_delivery_failure(),
+        recording_reminders_enabled: false,
+        recording_reminder_minutes: default_recording_reminder_minutes(),
+        recording_reminder_sound: false,
         audio_feedback: false,
         audio_feedback_volume: default_audio_feedback_volume(),
         sound_theme: default_sound_theme(),
@@ -1106,6 +1167,16 @@ fn apply_settings_migrations(
 ) -> bool {
     let mut updated = false;
 
+    // Bound hand-edited stores too: zero would cause repeated immediate alerts.
+    let reminder_minutes = settings.recording_reminder_minutes.clamp(
+        MIN_RECORDING_REMINDER_MINUTES,
+        MAX_RECORDING_REMINDER_MINUTES,
+    );
+    if reminder_minutes != settings.recording_reminder_minutes {
+        settings.recording_reminder_minutes = reminder_minutes;
+        updated = true;
+    }
+
     // One-time onboarding migration: users with an explicit selected model have
     // already made it through model selection. Users who merely have compatible
     // files on disk should still see onboarding.
@@ -1278,10 +1349,73 @@ mod tests {
             ShortcutActivation::HoldOrToggle
         );
         assert_eq!(settings.hold_threshold_ms, default_hold_threshold_ms());
+        assert_eq!(settings.dictation_target, DictationTarget::RecordingStart);
+        assert!(settings.notify_delivery_failure);
+        assert!(!settings.recording_reminders_enabled);
+        assert_eq!(settings.recording_reminder_minutes, 1);
+        assert!(!settings.recording_reminder_sound);
         assert!(!settings.audio_feedback);
         assert!(settings.filler_word_removal_enabled);
         // Bindings default to empty; the load path merges the real defaults in.
         assert!(settings.bindings.is_empty());
+    }
+
+    #[test]
+    fn dictation_preferences_survive_round_trip_and_migration() {
+        let mut stored = default_settings_json();
+        stored["dictation_target"] = serde_json::json!("recording_end");
+        stored["notify_delivery_failure"] = serde_json::json!(false);
+        stored["recording_reminders_enabled"] = serde_json::json!(true);
+        stored["recording_reminder_minutes"] = serde_json::json!(7);
+        stored["recording_reminder_sound"] = serde_json::json!(true);
+        stored["bindings"]["transcribe_to_clipboard"]["current_binding"] =
+            serde_json::json!("ctrl+shift+f12");
+
+        let mut settings: AppSettings = serde_json::from_value(stored.clone()).unwrap();
+        assert!(!apply_settings_migrations(&mut settings, &stored));
+        assert_eq!(settings.dictation_target, DictationTarget::RecordingEnd);
+        assert!(!settings.notify_delivery_failure);
+        assert!(settings.recording_reminders_enabled);
+        assert_eq!(settings.recording_reminder_minutes, 7);
+        assert!(settings.recording_reminder_sound);
+        assert_eq!(
+            settings.bindings["transcribe_to_clipboard"].current_binding,
+            "ctrl+shift+f12"
+        );
+        assert_eq!(serde_json::to_value(settings).unwrap(), stored);
+    }
+
+    #[test]
+    fn invalid_reminder_intervals_cannot_create_an_immediate_alert_loop() {
+        for (stored_minutes, expected) in [(0, 1), (121, 120), (u32::MAX, 120)] {
+            assert!(validate_recording_reminder_minutes(stored_minutes).is_err());
+            let mut stored = default_settings_json();
+            stored["recording_reminder_minutes"] = serde_json::json!(stored_minutes);
+            stored["recording_reminders_enabled"] = serde_json::json!(true);
+            let mut settings: AppSettings = serde_json::from_value(stored.clone()).unwrap();
+            assert!(apply_settings_migrations(&mut settings, &stored));
+            assert_eq!(settings.recording_reminder_minutes, expected);
+            assert!(settings.recording_reminders_enabled);
+            let normalized = serde_json::to_value(&settings).unwrap();
+            assert!(!apply_settings_migrations(&mut settings, &normalized));
+        }
+        for minutes in [1, 2, 7, 120] {
+            assert!(validate_recording_reminder_minutes(minutes).is_ok());
+        }
+    }
+
+    #[test]
+    fn invalid_dictation_target_does_not_reset_other_preferences() {
+        let mut stored = default_settings_json();
+        stored["dictation_target"] = serde_json::json!("future_target");
+        stored["recording_reminders_enabled"] = serde_json::json!(true);
+        stored["recording_reminder_minutes"] = serde_json::json!(5);
+        stored["bindings"]["transcribe"]["current_binding"] = serde_json::json!("f13");
+        let settings = salvage_settings(&stored);
+        assert_eq!(settings.dictation_target, DictationTarget::RecordingStart);
+        assert!(settings.recording_reminders_enabled);
+        assert_eq!(settings.recording_reminder_minutes, 5);
+        assert_eq!(settings.bindings["transcribe"].current_binding, "f13");
     }
 
     /// Frozen snapshot of a real v0.9.0-era settings store, as written to

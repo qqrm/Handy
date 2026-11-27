@@ -1,11 +1,13 @@
+use crate::recording_reminders::ReminderLease;
 use crate::settings::SoundTheme;
 use crate::settings::{self, AppSettings};
 use cpal::traits::{DeviceTrait, HostTrait};
 use log::{debug, error, warn};
-use rodio::OutputStreamBuilder;
+use rodio::{Decoder, OutputStreamBuilder, Sink};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use tauri::{AppHandle, Manager};
 
@@ -72,6 +74,35 @@ pub fn play_test_sound(app: &AppHandle, sound_type: SoundType) {
     }
 }
 
+/// Reminder audio is controlled by its own checkbox, independently of the
+/// Start/Stop feedback setting. A custom_reminder.wav in the app data folder
+/// overrides the bundled sound without changing the Start/Stop sound theme.
+pub(crate) fn play_reminder_sound(app: &AppHandle, lease: ReminderLease) {
+    let custom = crate::portable::resolve_app_data(app, "custom_reminder.wav").ok();
+    let path = custom.filter(|path| path.is_file()).or_else(|| {
+        app.path()
+            .resolve(
+                "resources/reminder.wav",
+                tauri::path::BaseDirectory::Resource,
+            )
+            .ok()
+    });
+    let Some(path) = path else {
+        return;
+    };
+    let settings = settings::get_settings(app);
+    thread::spawn(move || {
+        if let Err(error) = play_audio_file_guarded(
+            &path,
+            settings.selected_output_device,
+            settings.audio_feedback_volume,
+            Some(&lease),
+        ) {
+            error!("Failed to play reminder sound: {error}");
+        }
+    });
+}
+
 fn play_sound_async(app: &AppHandle, path: PathBuf) {
     let app_handle = app.clone();
     thread::spawn(move || {
@@ -98,6 +129,15 @@ fn play_audio_file(
     path: &std::path::Path,
     selected_device: Option<String>,
     volume: f32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    play_audio_file_guarded(path, selected_device, volume, None)
+}
+
+fn play_audio_file_guarded(
+    path: &std::path::Path,
+    selected_device: Option<String>,
+    volume: f32,
+    lease: Option<&ReminderLease>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stream_builder = if let Some(device_name) = selected_device {
         if device_name == "Default" {
@@ -134,8 +174,25 @@ fn play_audio_file(
     let file = File::open(path)?;
     let buf_reader = BufReader::new(file);
 
-    let sink = rodio::play(mixer, buf_reader)?;
+    // Decode and initialize the device before acquiring the recording lease.
+    // Set volume before append so even the first samples use the configured
+    // level. Stop can interrupt playback through the weak cancellation hook.
+    let source = Decoder::try_from(buf_reader)?;
+    let sink = Arc::new(Sink::connect_new(mixer));
     sink.set_volume(volume);
+    if let Some(lease) = lease {
+        let weak = Arc::downgrade(&sink);
+        lease.on_cancel(move || {
+            if let Some(sink) = weak.upgrade() {
+                sink.stop();
+            }
+        });
+        if lease.with_active(|| sink.append(source)).is_none() {
+            return Ok(());
+        }
+    } else {
+        sink.append(source);
+    }
     sink.sleep_until_end();
 
     Ok(())

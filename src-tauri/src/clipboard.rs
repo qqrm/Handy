@@ -28,7 +28,7 @@ fn with_enigo<T>(
     f(&mut enigo)
 }
 
-fn write_text_to_clipboard(app_handle: &AppHandle, text: &str) -> Result<(), String> {
+pub(crate) fn write_text_to_clipboard(app_handle: &AppHandle, text: &str) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     if is_wayland() && is_wl_copy_available() {
         info!("Using wl-copy for clipboard write on Wayland");
@@ -39,6 +39,66 @@ fn write_text_to_clipboard(app_handle: &AppHandle, text: &str) -> Result<(), Str
         .clipboard()
         .write_text(text)
         .map_err(|e| format!("Failed to write to clipboard: {}", e))
+}
+
+/// A guarded paste restores the old clipboard only after the target confirms
+/// insertion and only while this write still owns the clipboard. Dropping this
+/// value on failure intentionally leaves the complete dictation recoverable.
+#[cfg(windows)]
+pub(crate) struct GuardedClipboard {
+    restore: bool,
+    text: Option<String>,
+    image: Option<tauri::image::Image<'static>>,
+    sequence: u32,
+}
+
+#[cfg(windows)]
+pub(crate) fn prepare_guarded_paste_clipboard(
+    app: &AppHandle,
+    text: &str,
+    restore: bool,
+) -> Result<GuardedClipboard, String> {
+    let clipboard = app.clipboard();
+    let saved_text = if restore {
+        clipboard.read_text().ok()
+    } else {
+        None
+    };
+    let image = if restore && saved_text.is_none() {
+        clipboard.read_image().ok().map(|image| image.to_owned())
+    } else {
+        None
+    };
+    write_text_to_clipboard(app, text)?;
+    Ok(GuardedClipboard {
+        restore,
+        text: saved_text,
+        image,
+        sequence: unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() },
+    })
+}
+
+#[cfg(windows)]
+impl GuardedClipboard {
+    pub(crate) fn is_current(&self) -> bool {
+        (unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() })
+            == self.sequence
+    }
+
+    pub(crate) fn restore_after_verified_paste(self, app: &AppHandle) -> Result<(), String> {
+        if !self.restore || !self.is_current() {
+            return Ok(());
+        }
+        if let Some(text) = self.text {
+            write_text_to_clipboard(app, &text)
+        } else if let Some(image) = self.image {
+            app.clipboard()
+                .write_image(&image)
+                .map_err(|error| error.to_string())
+        } else {
+            app.clipboard().clear().map_err(|error| error.to_string())
+        }
+    }
 }
 
 fn finish_clipboard_paste(

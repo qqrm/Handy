@@ -156,6 +156,8 @@ mod imp {
         /// with widened modifiers), kept so deactivation unregisters the
         /// exact strings we registered.
         registered: Vec<ShortcutBinding>,
+        /// Generation used by recording-only shadow callbacks.
+        recording_scope: Option<u64>,
         /// Shadowed with identical semantics
         covered: Vec<String>,
         /// Shadowed, but side-specific modifiers widened to either side
@@ -472,12 +474,18 @@ mod imp {
                 .is_some()
             && settings.keyboard_implementation == KeyboardImplementation::HandyKeys;
 
-        let mut next = FallbackState::default();
+        let mut next = FallbackState {
+            recording_scope: crate::shortcut::recording_shortcut_scope(app),
+            ..FallbackState::default()
+        };
         let mut immune = 0usize;
         let mut wanted: Vec<(String, ShortcutBinding, bool)> = Vec::new();
         if eligible {
             for (id, binding) in &settings.bindings {
-                if id == "cancel" && !state.cancel_requested.load(Ordering::SeqCst) {
+                if crate::shortcut::is_recording_binding(id)
+                    && (!state.cancel_requested.load(Ordering::SeqCst)
+                        || next.recording_scope.is_none())
+                {
                     continue;
                 }
                 if id == "transcribe_with_post_process" && !settings.post_process_enabled {
@@ -497,9 +505,11 @@ mod imp {
         // Preserve unchanged registrations; unregister only stale shadows.
         let (kept, stale): (Vec<ShortcutBinding>, Vec<ShortcutBinding>) =
             previous.registered.into_iter().partition(|prev| {
-                wanted
-                    .iter()
-                    .any(|(_, shadow, _)| same_shadow(shadow, prev))
+                (!crate::shortcut::is_recording_binding(&prev.id)
+                    || previous.recording_scope == next.recording_scope)
+                    && wanted
+                        .iter()
+                        .any(|(_, shadow, _)| same_shadow(shadow, prev))
             });
 
         if !stale.is_empty() {

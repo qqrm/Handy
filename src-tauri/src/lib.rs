@@ -8,14 +8,19 @@ mod catalog;
 pub mod cli;
 mod clipboard;
 mod commands;
+mod dictation_output;
+#[cfg(windows)]
+mod dictation_target;
 mod helpers;
 mod input;
 mod llm_client;
 mod managers;
 mod memory;
+mod notifications;
 mod overlay;
 mod paste_tx;
 pub mod portable;
+mod recording_reminders;
 mod secure_input;
 mod settings;
 mod shortcut;
@@ -652,6 +657,11 @@ pub fn run(cli_args: CliArgs) {
             shortcut::reset_binding,
             shortcut::change_shortcut_activation_setting,
             shortcut::change_hold_threshold_ms_setting,
+            commands::dictation_settings::change_dictation_target_setting,
+            commands::dictation_settings::change_notify_delivery_failure_setting,
+            commands::dictation_settings::change_recording_reminders_enabled_setting,
+            commands::dictation_settings::change_recording_reminder_minutes_setting,
+            commands::dictation_settings::change_recording_reminder_sound_setting,
             shortcut::change_audio_feedback_setting,
             shortcut::change_audio_feedback_volume_setting,
             shortcut::change_sound_theme_setting,
@@ -1007,6 +1017,9 @@ pub fn run(cli_args: CliArgs) {
             // honors the runtime `--debug` override applied to `settings` above.
             WEBVIEW_LOG_STREAMING.store(settings.debug_mode, Ordering::Relaxed);
             let app_handle = app.handle().clone();
+            app.manage(dictation_output::DictationOutputState::default());
+            app.manage(recording_reminders::RecordingReminders::default());
+            notifications::init(&app_handle);
             app.manage(TranscriptionCoordinator::new(app_handle.clone()));
 
             initialize_core_logic(&app_handle);

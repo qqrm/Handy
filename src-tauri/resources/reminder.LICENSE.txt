@@ -1,0 +1,14 @@
+Reminder sound: Triple Knock on Door
+Original author: Tombombadil1988
+Source: https://freesound.org/people/Tombombadil1988/sounds/351144/
+Public HQ preview used: https://cdn.freesound.org/previews/351/351144_5567612-hq.mp3
+License: CC0 1.0 Universal
+License URL: https://creativecommons.org/publicdomain/zero/1.0/
+
+Adaptation: original recording at 2.1x tempo with pitch preserved, gain 0.7,
+converted to mono PCM WAV (44.1 kHz, 16 bit). Adaptation also under CC0.
+CC0 permits copying, modification, and redistribution, including commercial use.
+No endorsement by the original author is implied.
+
+To replace this sound locally, place custom_reminder.wav in Handy's app data
+folder. This override is independent of the Start/Stop sound theme.

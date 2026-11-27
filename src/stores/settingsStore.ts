@@ -9,6 +9,7 @@ import type {
   TranscribeAcceleratorSetting,
   OrtAcceleratorSetting,
   ShortcutActivation,
+  DictationTarget,
   VadBackend,
 } from "@/bindings";
 import { commands } from "@/bindings";
@@ -104,6 +105,36 @@ const settingUpdaters: {
     commands.changeShortcutActivationSetting(value as ShortcutActivation),
   hold_threshold_ms: (value) =>
     commands.changeHoldThresholdMsSetting(value as number),
+  dictation_target: async (value) => {
+    const result = await commands.changeDictationTargetSetting(
+      value as DictationTarget,
+    );
+    if (result.status === "error") throw new Error(result.error);
+  },
+  notify_delivery_failure: async (value) => {
+    const result = await commands.changeNotifyDeliveryFailureSetting(
+      value as boolean,
+    );
+    if (result.status === "error") throw new Error(result.error);
+  },
+  recording_reminders_enabled: async (value) => {
+    const result = await commands.changeRecordingRemindersEnabledSetting(
+      value as boolean,
+    );
+    if (result.status === "error") throw new Error(result.error);
+  },
+  recording_reminder_minutes: async (value) => {
+    const result = await commands.changeRecordingReminderMinutesSetting(
+      value as number,
+    );
+    if (result.status === "error") throw new Error(result.error);
+  },
+  recording_reminder_sound: async (value) => {
+    const result = await commands.changeRecordingReminderSoundSetting(
+      value as boolean,
+    );
+    if (result.status === "error") throw new Error(result.error);
+  },
   selected_microphone: (value) =>
     commands.setSelectedMicrophone(
       (value as string) === "Default" || value === null

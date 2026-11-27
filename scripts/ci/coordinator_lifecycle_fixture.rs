@@ -1,6 +1,8 @@
 //! Production coordinator/action/manager bodies are inserted by
 //! coordinator_regressions.py. Only Tauri and external audio/model/UI services
 //! are fakes. Gates force capture and post-capture cleanup to remain in flight.
+//! The successful-Stop continuation is an explicit fake ASR boundary: it records
+//! the frozen output mode and post-processing choice received from real Stop.
 #![allow(dead_code, unused_imports, unused_variables)]
 
 extern crate self as log;
@@ -112,6 +114,79 @@ struct ExternalEffects {
     stream_cancels: AtomicUsize,
     overlay_visible: AtomicBool,
     tray_recording: AtomicBool,
+    output_begins: AtomicUsize,
+    prepared_output: Mutex<Option<dictation_output::OutputMode>>,
+    asr_inputs: Mutex<Vec<(String, bool, Option<dictation_output::OutputMode>)>>,
+    reminder_events: Mutex<Vec<ReminderEvent>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReminderEvent {
+    Start(bool),
+    Lock,
+    Stop,
+}
+
+// External output-service hooks. The complete production output module has a
+// separate Cargo harness; here the real coordinator's calls and real output
+// selection policy are observed without a native clipboard or target field.
+mod dictation_output {
+    use super::*;
+    pub mod policy {
+        /* PRODUCTION_OUTPUT_POLICY */
+    }
+    pub use policy::OutputMode;
+    pub fn begin(app: &AppHandle) {
+        app.state::<Arc<ExternalEffects>>()
+            .output_begins
+            .fetch_add(1, Ordering::SeqCst);
+    }
+    pub fn prepare_stop(app: &AppHandle, mode: OutputMode) {
+        *app.state::<Arc<ExternalEffects>>()
+            .prepared_output
+            .lock()
+            .unwrap() = Some(mode);
+    }
+    pub fn take(app: &AppHandle) -> Option<OutputMode> {
+        app.state::<Arc<ExternalEffects>>()
+            .prepared_output
+            .lock()
+            .unwrap()
+            .take()
+    }
+    pub fn cancel(app: &AppHandle) {
+        app.state::<Arc<ExternalEffects>>()
+            .prepared_output
+            .lock()
+            .unwrap()
+            .take();
+    }
+}
+
+// Observe actual lifecycle calls; no fake timer or speech/VAD decision exists.
+mod recording_reminders {
+    use super::*;
+    pub fn start(app: &AppHandle, locked: bool) {
+        app.state::<Arc<ExternalEffects>>()
+            .reminder_events
+            .lock()
+            .unwrap()
+            .push(ReminderEvent::Start(locked));
+    }
+    pub fn lock(app: &AppHandle) {
+        app.state::<Arc<ExternalEffects>>()
+            .reminder_events
+            .lock()
+            .unwrap()
+            .push(ReminderEvent::Lock);
+    }
+    pub fn stop(app: &AppHandle) {
+        app.state::<Arc<ExternalEffects>>()
+            .reminder_events
+            .lock()
+            .unwrap()
+            .push(ReminderEvent::Stop);
+    }
 }
 
 mod settings {
@@ -172,8 +247,23 @@ mod memory {
 }
 mod shortcut {
     use super::*;
-    pub fn register_cancel_shortcut(_: &AppHandle) {}
+    mod recording_scope {
+        /* PRODUCTION_RECORDING_SCOPE */
+    }
+    pub fn recording_shortcut_scope(app: &AppHandle) -> Option<u64> {
+        app.try_state::<recording_scope::RecordingScope>()
+            .and_then(|scope| scope.snapshot().token())
+    }
+    pub fn register_cancel_shortcut(app: &AppHandle) {
+        if app.try_state::<recording_scope::RecordingScope>().is_none() {
+            app.manage(recording_scope::RecordingScope::default());
+        }
+        app.state::<recording_scope::RecordingScope>().start();
+    }
     pub fn unregister_cancel_shortcut(app: &AppHandle) {
+        if let Some(scope) = app.try_state::<recording_scope::RecordingScope>() {
+            scope.stop();
+        }
         app.state::<Arc<ExternalEffects>>()
             .cancellations
             .fetch_add(1, Ordering::SeqCst);
@@ -353,14 +443,37 @@ mod actions {
         /* PRODUCTION_ACTION_START */
         /* PRODUCTION_STOP_FUNCTION */
     }
+    fn finish_at_fake_asr_boundary(
+        app: &AppHandle,
+        binding_id: &str,
+        generation: u64,
+        post_process: bool,
+        output: Option<crate::dictation_output::OutputMode>,
+    ) {
+        app.state::<Arc<ExternalEffects>>()
+            .asr_inputs
+            .lock()
+            .unwrap()
+            .push((binding_id.to_string(), post_process, output));
+        // Complete real capture cleanup. Recognition, post-processing and
+        // actual delivery are outside this fixture's successful-Stop boundary.
+        let manager = app.state::<Arc<AudioRecordingManager>>();
+        manager.stop_recording(binding_id, generation, manager.cancel_generation());
+    }
     pub static ACTION_MAP: LazyLock<HashMap<String, Arc<dyn ShortcutAction>>> =
         LazyLock::new(|| {
-            HashMap::from([(
-                "transcribe".into(),
-                Arc::new(TranscribeAction {
-                    post_process: false,
-                }) as Arc<dyn ShortcutAction>,
-            )])
+            HashMap::from([
+                (
+                    "transcribe".into(),
+                    Arc::new(TranscribeAction {
+                        post_process: false,
+                    }) as Arc<dyn ShortcutAction>,
+                ),
+                (
+                    "transcribe_with_post_process".into(),
+                    Arc::new(TranscribeAction { post_process: true }) as Arc<dyn ShortcutAction>,
+                ),
+            ])
         });
 }
 
@@ -417,6 +530,209 @@ mod transcription_coordinator {
         ) {
             let command = rx.recv_timeout(TIMEOUT).unwrap();
             dispatch_command(app, state, command, tx);
+        }
+
+        fn key(binding: &str, pressed: bool, mode: ShortcutActivation) -> Command {
+            Command::Input(InputEvent {
+                binding_id: binding.into(),
+                hotkey_string: "fixture".into(),
+                is_pressed: pressed,
+                mode,
+                hold_threshold: Duration::from_millis(300),
+                external: true,
+            })
+        }
+
+        #[test]
+        fn queued_old_recording_shortcuts_cannot_stop_or_cancel_the_next_recording() {
+            for cancel in [false, true] {
+                let (app, effects, tx, rx) = fixture();
+                let mut state = CoordinatorState::new();
+                dispatch_command(&app, &mut state, input(), &tx);
+                let old_scope = crate::shortcut::recording_shortcut_scope(&app).unwrap();
+                // The old callback passed its early scope check, then was
+                // preempted until the original operation completely finished.
+                dispatch_command(&app, &mut state, input(), &tx);
+                deliver(&app, &mut state, &tx, &rx);
+                dispatch_command(&app, &mut state, input(), &tx);
+                let current_scope = crate::shortcut::recording_shortcut_scope(&app).unwrap();
+                assert_ne!(old_scope, current_scope);
+                let queued = if cancel {
+                    Command::CancelRecording(old_scope)
+                } else {
+                    Command::FinishToClipboard("ctrl+escape".into(), old_scope)
+                };
+                dispatch_command(&app, &mut state, queued, &tx);
+                assert_eq!(
+                    state.stage,
+                    Stage::Recording("transcribe".into()),
+                    "REGRESSION: a queued old recording shortcut affected the next recording"
+                );
+                assert_eq!(effects.capture_stops.load(Ordering::SeqCst), 1);
+                assert_eq!(effects.asr_inputs.lock().unwrap().len(), 1);
+                dispatch_command(
+                    &app,
+                    &mut state,
+                    Command::FinishToClipboard("ctrl+escape".into(), current_scope),
+                    &tx,
+                );
+                assert_eq!(state.stage, Stage::Processing);
+                assert_eq!(
+                    effects.asr_inputs.lock().unwrap()[1].2,
+                    Some(OutputMode::ClipboardOnly)
+                );
+            }
+        }
+
+        #[test]
+        fn clipboard_stop_freezes_policy_before_instant_recognition_and_preserves_postprocess() {
+            let (app, effects, tx, rx) = fixture();
+            let mut state = CoordinatorState::new();
+            let binding = "transcribe_with_post_process";
+            dispatch_command(
+                &app,
+                &mut state,
+                key(binding, true, ShortcutActivation::Toggle),
+                &tx,
+            );
+            app.state::<TranscriptionCoordinator>().finish_to_clipboard(
+                "ctrl+escape",
+                crate::shortcut::recording_shortcut_scope(&app).unwrap_or(0),
+            );
+            deliver(&app, &mut state, &tx, &rx);
+            // The fake recognizer completes in this very Stop call. There is
+            // no post-stop timing window in which another key can choose mode.
+            assert_eq!(
+                *effects.asr_inputs.lock().unwrap(),
+                vec![(binding.into(), true, Some(OutputMode::ClipboardOnly))],
+                "REGRESSION: clipboard completion changed its output policy or original action"
+            );
+            assert_eq!(state.stage, Stage::Processing);
+            assert!(effects.prepared_output.lock().unwrap().is_none());
+            assert_eq!(effects.capture_stops.load(Ordering::SeqCst), 1);
+            assert_eq!(effects.starts.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn clipboard_shortcut_is_inert_while_idle_and_after_normal_stop() {
+            let (app, effects, tx, rx) = fixture();
+            let mut state = CoordinatorState::new();
+            app.state::<TranscriptionCoordinator>().finish_to_clipboard(
+                "ctrl+escape",
+                crate::shortcut::recording_shortcut_scope(&app).unwrap_or(0),
+            );
+            deliver(&app, &mut state, &tx, &rx);
+            assert_eq!(state.stage, Stage::Idle);
+            assert_eq!(effects.starts.load(Ordering::SeqCst), 0);
+            assert_eq!(effects.output_begins.load(Ordering::SeqCst), 0);
+            dispatch_command(&app, &mut state, input(), &tx);
+            dispatch_command(&app, &mut state, input(), &tx);
+            assert_eq!(state.stage, Stage::Processing);
+            // The processing completion is intentionally not dispatched yet.
+            dispatch_command(
+                &app,
+                &mut state,
+                Command::FinishToClipboard(
+                    "ctrl+escape".into(),
+                    crate::shortcut::recording_shortcut_scope(&app).unwrap_or(0),
+                ),
+                &tx,
+            );
+            assert_eq!(
+                *effects.asr_inputs.lock().unwrap(),
+                vec![("transcribe".into(), false, Some(OutputMode::Insert))],
+                "REGRESSION: clipboard shortcut rewrote an already completed normal Stop"
+            );
+            assert_eq!(effects.capture_stops.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn clipboard_stop_discards_the_old_release_before_a_fast_new_recording() {
+            let (app, effects, tx, rx) = fixture();
+            let mut state = CoordinatorState::new();
+            let mode = ShortcutActivation::PushToTalk;
+            dispatch_command(&app, &mut state, key("transcribe", true, mode), &tx);
+            dispatch_command(&app, &mut state, key("transcribe", false, mode), &tx);
+            assert!(state.pending_release.is_some());
+            dispatch_command(
+                &app,
+                &mut state,
+                Command::FinishToClipboard(
+                    "ctrl+escape".into(),
+                    crate::shortcut::recording_shortcut_scope(&app).unwrap_or(0),
+                ),
+                &tx,
+            );
+            deliver(&app, &mut state, &tx, &rx);
+            assert_eq!(state.stage, Stage::Idle);
+            dispatch_command(&app, &mut state, key("transcribe", true, mode), &tx);
+            assert_eq!(
+                effects.starts.load(Ordering::SeqCst),
+                2,
+                "REGRESSION: the previous release swallowed the next recording's Start"
+            );
+            assert_eq!(state.stage, Stage::Recording("transcribe".into()));
+            assert_eq!(effects.asr_inputs.lock().unwrap().len(), 1);
+            assert_eq!(effects.capture_stops.load(Ordering::SeqCst), 1);
+            assert!(state.pending_release.is_none());
+        }
+
+        #[test]
+        fn reminder_hooks_distinguish_holding_tapping_and_cancellation() {
+            let (app, effects, tx, rx) = fixture();
+            let mut state = CoordinatorState::new();
+            let mode = ShortcutActivation::HoldOrToggle;
+            dispatch_command(&app, &mut state, key("transcribe", true, mode), &tx);
+            assert_eq!(
+                *effects.reminder_events.lock().unwrap(),
+                vec![crate::ReminderEvent::Start(false)]
+            );
+            dispatch_command(&app, &mut state, key("transcribe", false, mode), &tx);
+            let pressed_at = state.hold.as_ref().unwrap().pressed_at;
+            let pending = state.pending_release.as_mut().unwrap();
+            pending.released_at = pressed_at + Duration::from_millis(1);
+            pending.deadline = Instant::now();
+            // Exercise the exact timeout branch's production methods without
+            // wall-clock sleeps or a fake VAD/speech event.
+            if let Some(effect) = state.on_grace_expired() {
+                run_effect(&app, &mut state, effect);
+            }
+            sync_recording_lock(&app, &state);
+            assert_eq!(
+                *effects.reminder_events.lock().unwrap(),
+                vec![
+                    crate::ReminderEvent::Start(false),
+                    crate::ReminderEvent::Lock
+                ],
+                "REGRESSION: a tap did not enable recording reminders"
+            );
+            let (capture_gate, capture) = gate();
+            *effects.capture_gate.lock().unwrap() = Some(capture_gate);
+            dispatch_command(&app, &mut state, Command::Cancel, &tx);
+            capture.wait_entered();
+            assert_eq!(
+                effects.reminder_events.lock().unwrap().last(),
+                Some(&crate::ReminderEvent::Stop),
+                "REGRESSION: cancellation left recording reminders running"
+            );
+            capture.release();
+            deliver(&app, &mut state, &tx, &rx);
+            assert_eq!(state.stage, Stage::Idle);
+
+            effects.reminder_events.lock().unwrap().clear();
+            dispatch_command(&app, &mut state, input(), &tx);
+            assert_eq!(
+                *effects.reminder_events.lock().unwrap(),
+                vec![
+                    crate::ReminderEvent::Start(true),
+                    crate::ReminderEvent::Lock
+                ]
+            );
+            dispatch_command(&app, &mut state, input(), &tx);
+            assert_eq!(
+                effects.reminder_events.lock().unwrap().last(),
+                Some(&crate::ReminderEvent::Stop)
+            );
         }
 
         #[test]

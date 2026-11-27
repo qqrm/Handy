@@ -4,11 +4,9 @@
 //! used by both the Tauri and handy-keys implementations.
 
 use log::warn;
-use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 
 use crate::actions::ACTION_MAP;
-use crate::managers::audio::AudioRecordingManager;
 use crate::settings::get_settings;
 use crate::transcription_coordinator::is_transcribe_binding;
 use crate::TranscriptionCoordinator;
@@ -31,7 +29,29 @@ pub fn handle_shortcut_event(
     binding_id: &str,
     hotkey_string: &str,
     is_pressed: bool,
+    scope: Option<u64>,
 ) {
+    if super::is_recording_binding(binding_id)
+        && !scope.is_some_and(|token| super::recording_shortcuts::accepts(app, token))
+    {
+        return;
+    }
+
+    if super::is_recording_binding(binding_id) {
+        if is_pressed {
+            if let (Some(coordinator), Some(scope)) =
+                (app.try_state::<TranscriptionCoordinator>(), scope)
+            {
+                if binding_id == "cancel" {
+                    coordinator.cancel_recording(scope);
+                } else {
+                    coordinator.finish_to_clipboard(hotkey_string, scope);
+                }
+            }
+        }
+        return;
+    }
+
     let settings = get_settings(app);
 
     // Transcribe bindings are handled by the coordinator.
@@ -57,15 +77,6 @@ pub fn handle_shortcut_event(
         );
         return;
     };
-
-    // Cancel binding: only fires when recording and key is pressed
-    if binding_id == "cancel" {
-        let audio_manager = app.state::<Arc<AudioRecordingManager>>();
-        if audio_manager.is_recording() && is_pressed {
-            action.start(app, binding_id, hotkey_string);
-        }
-        return;
-    }
 
     // Remaining bindings (e.g. "test") use simple start/stop on press/release.
     if is_pressed {
