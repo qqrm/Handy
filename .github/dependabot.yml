@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # Use Bun's updater so version PRs update the actual bun.lock.
+  # GitHub does not currently support automatic Bun security updates.
+  - package-ecosystem: "bun"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 3
+    groups:
+      translations:
+        patterns:
+          - "i18next"
+          - "react-i18next"

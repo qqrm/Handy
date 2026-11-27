@@ -60,6 +60,9 @@ jobs:
       - name: Test keyboard utilities
         run: bun run test:keyboard
 
+      - name: Test translation compatibility
+        run: bun run test:i18n
+
       - name: Run ESLint
         run: bun run lint
 
