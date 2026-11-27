@@ -98,7 +98,10 @@ signal-hook = "0.3"
 tauri-plugin-autostart = "2.5.1"
 tauri-plugin-global-shortcut = "2.3.1"
 tauri-plugin-single-instance = "2.3.2"
-tauri-plugin-updater = "2.10.1"
+# Handy publishes Tauri v2 updater artifacts (raw Windows installers and Linux
+# AppImages), so the legacy v1 archive compatibility feature is unnecessary.
+# Keep TLS enabled; macOS .app.tar.gz support does not depend on this feature.
+tauri-plugin-updater = { version = "2.10.1", default-features = false, features = ["rustls-tls"] }
 
 [target.'cfg(windows)'.dependencies]
 # Used to reach ICoreWebView2Settings3 through the webview's controller
